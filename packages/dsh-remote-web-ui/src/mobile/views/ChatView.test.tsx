@@ -185,6 +185,22 @@ describe('ChatView message folds', () => {
       expect(sendCommandMock).toHaveBeenCalledWith('s-1', '/permission danger-full-access')
     })
   })
+  it('shows context occupancy from the latest usage against the advertised window', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
+      ...turnEvents().map((entry, index) => makeEntry(entry.event.type, entry.event.data, index + 1)),
+      makeEntry('assistant/message', {
+        turn: 1,
+        step: 0,
+        message: { id: 'a-2', role: 'assistant', content: [{ type: 'text', text: '收尾' }] },
+        usage: { inputTokens: 5_000, outputTokens: 100, cacheReadTokens: 45_000 },
+      }, 7),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    // (5000 + 45000) / 100000 = 50%.
+    expect(await screen.findByText('上下文 50%')).toBeTruthy()
+  })
 })
 
 describe('ChatView model sheet', () => {

@@ -1,6 +1,6 @@
 /** foldEvents: message-list folding from a session event stream. */
 import { describe, expect, it } from 'vitest'
-import { foldEvents, type WireEvent } from './messages.ts'
+import { foldEvents, latestContextWindow, type WireEvent } from './messages.ts'
 
 /** Assemble one event with an auto-incrementing seq / time. */
 function makeEvent(
@@ -218,5 +218,26 @@ describe('foldEvents', () => {
     const snapshot = JSON.stringify(first)
     foldEvents([makeEvent('assistant/message', assistantMessageData('a-1', 0, 0, 'world'), 1)], first)
     expect(JSON.stringify(first)).toBe(snapshot)
+  })
+
+  it('keeps the final usage on the assistant message and tracks the context window', () => {
+    const events: WireEvent[] = [
+      makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
+      makeEvent('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+        usage: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 3000 },
+      }, 1),
+      makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 200_000 }, 2),
+    ]
+    const result = foldEvents(events)
+    expect(result).toHaveLength(1)
+    expect(result[0]?.usage).toEqual({ inputTokens: 1200, cacheReadTokens: 3000, cacheWriteTokens: 0 })
+    // The newest advertisement wins; an older page cannot roll it back.
+    const tracked = latestContextWindow(events)
+    expect(tracked).toEqual({ window: 200_000, seq: 2 })
+    const olderPage: WireEvent[] = [events[0] as WireEvent]
+    expect(latestContextWindow(olderPage, tracked)).toEqual({ window: 200_000, seq: 2 })
   })
 })

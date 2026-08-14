@@ -546,6 +546,19 @@ body {
   font-size: 14px;
 }
 
+/* Context occupancy readout at the trailing end of the composer toolbar. */
+.chat-context {
+  flex: none;
+  align-self: center;
+  color: var(--m-text-tertiary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chat-context-high {
+  color: var(--m-danger);
+}
+
 /* ── bottom sheets ───────────────────────────────────────────────────── */
 
 .sheet-backdrop {
