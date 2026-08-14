@@ -11,12 +11,13 @@
  *   permission pickers, both as bottom sheets.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { MuxFrame } from '@deepseek-ai/dsh-host-apiproxy/api/events'
 import type { SessionModels } from '@deepseek-ai/dsh-host-apiproxy/api/sessions'
 import { loadHistory, prompt, type SessionView } from './App.tsx'
 import { errorText, formatTime, staleHostHint } from './App.tsx'
 import { models, selectModel, sendCommand } from '../api.ts'
+import { getDisplayOptions, setDisplayOptions, subscribeDisplayOptions } from '../display-options.ts'
 import { foldEvents, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { MuxClient } from '../mux.ts'
 import { ThemeToggle } from '../theme-toggle.tsx'
@@ -101,24 +102,43 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const [sending, setSending] = useState(false)
   const scrollRef = useRef<HTMLDivElement | undefined>(undefined)
   const pendingRef = useRef(false)
+  /**
+   * True while the initial tail page is in flight. Live events arriving in
+   * that window go to {@link liveBufferRef} instead of the message list: the
+   * tail load replaces the list wholesale, so a directly folded event would
+   * flash once, be discarded by the snapshot, and then be skipped forever by
+   * the seq watermark.
+   */
+  const tailLoadingRef = useRef(true)
+  /** Live session events buffered while the initial tail page loads. */
+  const liveBufferRef = useRef<WireEvent[]>([])
 
   /** The session's permission select (absent = capability not composed). */
   const [permissions, setPermissions] = useState<PermissionSelectValue | undefined>(undefined)
   /** The current model selection for the toolbar chip (best-effort label). */
   const [currentModel, setCurrentModel] = useState<{ provider: string; model: string; reasoningEffort?: string } | undefined>(undefined)
   /** Which bottom sheet is open. */
-  const [sheet, setSheet] = useState<'model' | 'permission' | null>(null)
+  const [sheet, setSheet] = useState<'model' | 'permission' | 'display' | null>(null)
+  /** Chat display options (tool disclosures, host-injected messages). */
+  const displayOptions = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
 
   // Tail page on open (content loads only when the session is opened).
   useEffect(() => {
     let cancelled = false
+    tailLoadingRef.current = true
+    liveBufferRef.current = []
     setLoading(true)
     setError(undefined)
     setMessages([])
     void loadHistory(session.sessionId).then(
       (page) => {
         if (cancelled) return
-        setMessages(foldEvents(page.events.map(eventOf)))
+        // Buffered live events re-fold on top of the snapshot; the watermark
+        // drops any the snapshot already includes, so nothing is lost or doubled.
+        const buffered = liveBufferRef.current
+        liveBufferRef.current = []
+        tailLoadingRef.current = false
+        setMessages(foldEvents(buffered, foldEvents(page.events.map(eventOf))))
         setHasOlder(page.hasMore)
         setLoading(false)
         // The history-tail projection baseline seeds the permission picker.
@@ -129,6 +149,11 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
       },
       (reason: unknown) => {
         if (cancelled) return
+        // Load failed: flush the buffer so the live stream still renders.
+        const buffered = liveBufferRef.current
+        liveBufferRef.current = []
+        tailLoadingRef.current = false
+        if (buffered.length > 0) setMessages(foldEvents(buffered))
         setError(errorText(reason))
         setLoading(false)
       },
@@ -150,7 +175,12 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     return mux.onFrame((frame: MuxFrame) => {
       if (frame.type === 'session/event') {
         if (frame.sessionId !== session.sessionId) return
-        setMessages(previous => foldEvents([frame.event as WireEvent], previous))
+        const event = frame.event as WireEvent
+        if (tailLoadingRef.current) {
+          liveBufferRef.current.push(event)
+          return
+        }
+        setMessages(previous => foldEvents([event], previous))
         return
       }
       // Live projection pushes keep the permission picker current.
@@ -239,6 +269,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     ? undefined
     : permissions.options.find(option => option.value === permissions.currentValue)?.name
       ?? displayName(permissions.currentValue)
+  /** Messages after the display-option filter (host-injected rows hidden by default). */
+  const visibleMessages = displayOptions.showSystemMessages
+    ? messages
+    : messages.filter(message => message.sourceKind === undefined)
 
   return (
     <div className="chat">
@@ -254,9 +288,9 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
             {loading ? '加载中…' : '加载更早的消息'}
           </button>
         )}
-        {messages.map(message => <MessageRow key={message.id} message={message} />)}
-        {loading && messages.length === 0 && <p className="chat-typing">加载中…</p>}
-        {!loading && messages.length === 0 && <p className="chat-typing">还没有消息，发一句话开始吧</p>}
+        {visibleMessages.map(message => <MessageRow key={message.id} message={message} showTools={displayOptions.showTools} />)}
+        {loading && visibleMessages.length === 0 && <p className="chat-typing">加载中…</p>}
+        {!loading && visibleMessages.length === 0 && <p className="chat-typing">还没有消息，发一句话开始吧</p>}
       </div>
       <div className="chat-tools">
         <button type="button" className="chat-chip" onClick={() => { setSheet('model') }} aria-haspopup="dialog">
@@ -271,6 +305,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
             <span className="chat-chip-chevron" aria-hidden>›</span>
           </button>
         )}
+        <button type="button" className="chat-chip" onClick={() => { setSheet('display') }} aria-haspopup="dialog">
+          <span className="chat-chip-label">显示</span>
+          <span className="chat-chip-chevron" aria-hidden>›</span>
+        </button>
       </div>
       <div className="chat-inputbar">
         <textarea
@@ -309,6 +347,7 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           onClose={() => { setSheet(null) }}
         />
       )}
+      {sheet === 'display' && <DisplaySheet onClose={() => { setSheet(null) }} />}
     </div>
   )
 }
@@ -316,13 +355,13 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
 /* ── message rows ─────────────────────────────────────────────────────── */
 
 /** One rendered message row (user bubble or assistant bubble with folds). */
-function MessageRow({ message }: { message: RenderMessage }) {
+function MessageRow({ message, showTools }: { message: RenderMessage; showTools: boolean }) {
   return (
     <div className={`chat-msg chat-msg-${message.kind}${message.pending === true ? ' chat-msg-pending' : ''}${message.failed === true ? ' chat-msg-failed' : ''}`}>
       {message.kind === 'assistant' && message.reasoning !== undefined && message.reasoning !== '' && (
         <ReasoningDisclosure text={message.reasoning} pending={message.pending === true} />
       )}
-      {message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0 && (
+      {showTools && message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0 && (
         <ToolDisclosure tools={message.tools} />
       )}
       <CollapsibleText text={message.text} />
@@ -659,6 +698,44 @@ function PermissionSheet({ sessionId, value, onChanged, onClose }: {
           </button>
         )
       })}
+    </Sheet>
+  )
+}
+
+/** Display-option toggles: tool-call disclosures and host-injected messages. */
+function DisplaySheet({ onClose }: { onClose(): void }) {
+  const options = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
+  const rows = [
+    {
+      key: 'showTools' as const,
+      title: '工具调用',
+      description: '关闭后只保留最终回复，不再展示工具调用卡片',
+      on: options.showTools,
+    },
+    {
+      key: 'showSystemMessages' as const,
+      title: '系统提示词',
+      description: '工作区指令、技能目录等注入内容',
+      on: options.showSystemMessages,
+    },
+  ]
+  return (
+    <Sheet title="显示选项" onClose={onClose}>
+      {rows.map(row => (
+        <button
+          type="button"
+          key={row.key}
+          className={`sheet-option${row.on ? ' sheet-option-selected' : ''}`}
+          aria-pressed={row.on}
+          onClick={() => { setDisplayOptions({ [row.key]: !row.on }) }}
+        >
+          <span className="sheet-option-copy">
+            <span className="sheet-option-title">{row.title}</span>
+            <span className="sheet-option-desc">{row.description}</span>
+          </span>
+          {row.on && <span className="sheet-option-check" aria-hidden>√</span>}
+        </button>
+      ))}
     </Sheet>
   )
 }

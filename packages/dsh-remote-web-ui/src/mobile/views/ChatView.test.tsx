@@ -24,6 +24,7 @@ vi.mock('./App.tsx', async importOriginal => {
   }
 })
 import { models, selectModel, sendCommand } from '../api.ts'
+import { setDisplayOptions } from '../display-options.ts'
 import { loadHistory } from './App.tsx'
 
 const session: SessionView = {
@@ -184,6 +185,86 @@ describe('ChatView message folds', () => {
     await waitFor(() => {
       expect(sendCommandMock).toHaveBeenCalledWith('s-1', '/permission danger-full-access')
     })
+  })
+})
+
+describe('ChatView initial-load race', () => {
+  /** Minimal mux stand-in: captures the ChatView's frame listener for hand-off. */
+  class FakeMux {
+    listeners = new Set<(frame: unknown) => void>()
+    onFrame(listener: (frame: unknown) => void): () => void {
+      this.listeners.add(listener)
+      return () => { this.listeners.delete(listener) }
+    }
+    emit(frame: unknown): void {
+      for (const listener of this.listeners) listener(frame)
+    }
+  }
+
+  it('keeps live events that arrive while the tail page is still loading', async () => {
+    let resolveHistory: (page: HistoryPage) => void = () => {}
+    loadHistoryMock.mockReturnValue(new Promise<HistoryPage>((resolve) => { resolveHistory = resolve }))
+    const mux = new FakeMux()
+    render(<ChatView session={session} mux={mux as never} onBack={() => {}} />)
+
+    // A live turn starts before the snapshot resolves: chunk, tool call, final.
+    await act(async () => {
+      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('assistant/chunk', { turn: 1, step: 0, chunk: { type: 'text-delta', text: '正在' } }, 6).event })
+      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('tool/call', { turn: 1, step: 0, callId: 'c9', name: 'bash', arguments: '{"cmd":"ls"}' }, 7).event })
+      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('assistant/message', { turn: 1, step: 0, message: { id: 'a-9', role: 'assistant', content: [{ type: 'text', text: '实时新消息' }] } }, 8).event })
+    })
+    // The snapshot predates those events; resolving it must not drop them.
+    await act(async () => { resolveHistory(historyPage(turnEvents())) })
+
+    expect(await screen.findByText('实时新消息')).toBeTruthy()
+    // The history turn's tool disclosure plus the live one both render.
+    expect((await screen.findAllByRole('button', { name: /工具/ })).length).toBe(2)
+  })
+})
+
+describe('ChatView display options', () => {
+  beforeEach(() => {
+    // The store is module-level; reset both toggles so tests stay independent.
+    setDisplayOptions({ showTools: true, showSystemMessages: false })
+  })
+
+  it('hides host-injected messages by default and reveals them from the display sheet', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('user/message', {
+        id: 'sys-1',
+        role: 'user',
+        source: { kind: 'agent-instructions' },
+        content: [{ type: 'text', text: '注入的工作区指令' }],
+      }, 0),
+      ...turnEvents().map((entry, index) => makeEntry(entry.event.type, entry.event.data, index + 1)),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByText('改一下代码')).toBeTruthy()
+    expect(screen.queryByText('注入的工作区指令')).toBeNull()
+
+    fireEvent.click(await screen.findByRole('button', { name: /显示/ }))
+    const toggle = await screen.findByRole('button', { name: /系统提示词/ })
+    expect(toggle.getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-pressed')).toBe('true')
+    expect(await screen.findByText('注入的工作区指令')).toBeTruthy()
+  })
+
+  it('hides tool disclosures when the tools option is switched off', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
+    render(<ChatView session={session} onBack={() => {}} />)
+    expect(await screen.findByRole('button', { name: /工具/ })).toBeTruthy()
+
+    fireEvent.click(await screen.findByRole('button', { name: /显示/ }))
+    fireEvent.click(await screen.findByRole('button', { name: /工具调用/ }))
+    // Close the sheet (backdrop click) so its rows do not match the query.
+    const backdrop = document.querySelector('.sheet-backdrop')
+    expect(backdrop).not.toBeNull()
+    fireEvent.click(backdrop as Element)
+    await waitFor(() => { expect(screen.queryByRole('button', { name: /工具/ })).toBeNull() })
+    // The final assistant text still renders without the tool card.
+    expect(screen.getByText('已完成修改')).toBeTruthy()
   })
 })
 
