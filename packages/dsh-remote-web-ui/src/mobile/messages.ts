@@ -75,13 +75,12 @@ export interface RenderMessage {
   /** Set when the owning turn ended in an error. */
   readonly failed?: boolean
   /**
-<<<<<<< HEAD
    * `source.kind` of a user-role message injected by the host rather than
    * typed by the user (e.g. `agent-instructions`, `plugin`, `skill-catalog`).
    * Absent for genuine user prompts; the surface hides these by default.
    */
   readonly sourceKind?: string
-=======
+  /**
    * Final usage of this assistant step (from the closing `assistant/message`).
    * Context occupancy after the step ≈ inputTokens + cacheReadTokens +
    * cacheWriteTokens — the full prompt the next request builds on.
@@ -101,7 +100,6 @@ export interface ContextWindow {
   readonly window: number
   /** Seq of the event that advertised it (older advertisements never override). */
   readonly seq: number
->>>>>>> feat/mobile-context-usage
 }
 
 /** One tool call attached to an assistant message (callId dedupes repeats). */

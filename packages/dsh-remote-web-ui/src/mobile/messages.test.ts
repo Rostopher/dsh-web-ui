@@ -238,7 +238,6 @@ describe('foldEvents', () => {
     expect(JSON.stringify(first)).toBe(snapshot)
   })
 
-<<<<<<< HEAD
   it('marks host-injected user-role messages with their source kind', () => {
     const events: WireEvent[] = [
       makeEvent('user/message', userMessageData('u-1', 'hello'), 0),
@@ -253,7 +252,8 @@ describe('foldEvents', () => {
     expect(result).toHaveLength(2)
     expect(result[0]?.sourceKind).toBeUndefined()
     expect(result[1]).toMatchObject({ id: 'sys-1', kind: 'user', sourceKind: 'agent-instructions' })
-=======
+  })
+
   it('keeps the final usage on the assistant message and tracks the context window', () => {
     const events: WireEvent[] = [
       makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
@@ -273,6 +273,5 @@ describe('foldEvents', () => {
     expect(tracked).toEqual({ window: 200_000, seq: 2 })
     const olderPage: WireEvent[] = [events[0] as WireEvent]
     expect(latestContextWindow(olderPage, tracked)).toEqual({ window: 200_000, seq: 2 })
->>>>>>> feat/mobile-context-usage
   })
 })
