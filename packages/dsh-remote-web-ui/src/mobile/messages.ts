@@ -530,8 +530,9 @@ function applyTurnEnd(state: FoldState, event: WireEvent): void {
       ...message,
       ...(wasPending ? { pending: false } : {}),
       ...(failed ? { failed: true } : {}),
-      seq: Math.max(message.seq, event.seq),
-      time: event.time,
+      // seq and time stay the message's own: bumping them to the turn/end
+      // event equalized every sort key in the turn and left the final order
+      // to the lexicographic id tie-break (final answer above its tool steps).
     })
   }
 }

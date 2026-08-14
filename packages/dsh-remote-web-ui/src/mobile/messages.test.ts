@@ -183,6 +183,24 @@ describe('foldEvents', () => {
     expect(assistant?.pending).toBeFalsy()
   })
 
+  it('keeps per-step order after turn/end (regression: turn/end must not rewrite seq)', () => {
+    // Mirrors a real multi-step turn: each step's final assistant/message is
+    // followed by its tool calls; turn/end closes the turn last. turn/end
+    // used to bump every assistant message of the turn to its own seq, which
+    // equalized every sort key and left the final order to the lexicographic
+    // id tie-break — the final answer could surface above its own tool steps.
+    const events: WireEvent[] = [
+      makeEvent('user/message', userMessageData('u-1', 'hello'), 100),
+      makeEvent('assistant/message', assistantMessageData('z-1', 1, 1, '第一步'), 110),
+      makeEvent('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'glob', arguments: '{}' }, 111),
+      makeEvent('assistant/message', assistantMessageData('m-2', 1, 2, ''), 120),
+      makeEvent('tool/call', { turn: 1, step: 2, callId: 'c2', name: 'read', arguments: '{}' }, 121),
+      makeEvent('assistant/message', assistantMessageData('a-3', 1, 3, '最终答案'), 130),
+      makeEvent('turn/end', { turn: 1, reason: { kind: 'completed' } }, 140),
+    ]
+    expect(foldEvents(events).map(message => message.id)).toEqual(['u-1', 'z-1', 'm-2', 'a-3'])
+  })
+
   it('is idempotent: applying the same batch twice yields an identical list', () => {
     const events: WireEvent[] = [
       makeEvent('user/message', userMessageData('u-1', 'hi'), 0),
