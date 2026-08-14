@@ -19,7 +19,13 @@
  * - `turn/start`        data = `{ turn }`
  * - `turn/end`          data = `{ turn, reason: { kind: 'error' | ... } }`
  * - `tool/call`         data = `{ turn, step, callId, name, arguments }`
+ * - `request/context`   data = `{ provider, model, contextWindow? }` (not a
+ *   message; {@link latestContextWindow} tracks the advertised window)
  * - `session/end-seed`  empty data (skipped)
+ *
+ * `assistant/message` may also carry `usage` (`{ inputTokens, cacheReadTokens,
+ * cacheWriteTokens, ... }`); the fold keeps it on the message so the surface
+ * can show context occupancy against the tracked window.
  *
  * Assistant content blocks (`text` vs `reasoning`) fold into two separate
  * fields — `text` and `reasoning` — so the surface can show reasoning behind
@@ -69,11 +75,33 @@ export interface RenderMessage {
   /** Set when the owning turn ended in an error. */
   readonly failed?: boolean
   /**
+<<<<<<< HEAD
    * `source.kind` of a user-role message injected by the host rather than
    * typed by the user (e.g. `agent-instructions`, `plugin`, `skill-catalog`).
    * Absent for genuine user prompts; the surface hides these by default.
    */
   readonly sourceKind?: string
+=======
+   * Final usage of this assistant step (from the closing `assistant/message`).
+   * Context occupancy after the step ≈ inputTokens + cacheReadTokens +
+   * cacheWriteTokens — the full prompt the next request builds on.
+   */
+  readonly usage?: MessageUsage
+}
+
+/** Token counters of one finished assistant step. */
+export interface MessageUsage {
+  readonly inputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+/** Session context window as advertised by the latest `request/context` event. */
+export interface ContextWindow {
+  readonly window: number
+  /** Seq of the event that advertised it (older advertisements never override). */
+  readonly seq: number
+>>>>>>> feat/mobile-context-usage
 }
 
 /** One tool call attached to an assistant message (callId dedupes repeats). */
@@ -112,6 +140,18 @@ function pickString(value: unknown): string | undefined {
 
 function pickNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/** Parse the usage counter of an `assistant/message` payload; undefined when absent. */
+function pickUsage(value: unknown): MessageUsage | undefined {
+  if (!isRecord(value)) return undefined
+  const inputTokens = pickNumber(value['inputTokens'])
+  if (inputTokens === undefined) return undefined
+  return {
+    inputTokens,
+    cacheReadTokens: pickNumber(value['cacheReadTokens']) ?? 0,
+    cacheWriteTokens: pickNumber(value['cacheWriteTokens']) ?? 0,
+  }
 }
 
 /** Fallback message id for events without a stable wire id. */
@@ -332,6 +372,7 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
   const step = pickNumber(data['step'])
   const finalText = textFromContent(messageData['content'])
   const finalReasoning = reasoningFromContent(messageData['content'])
+  const usage = pickUsage(data['usage'])
   const key = tsKey(turn, step)
 
   // Finalize the matching assistant message (by id, or by turn/step for the
@@ -347,6 +388,7 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
       // The final content block list is authoritative; an adapter that omits
       // reasoning from the final message keeps the streamed reasoning text.
       ...(finalReasoning !== '' ? { reasoning: finalReasoning } : {}),
+      ...(usage !== undefined ? { usage } : {}),
       seq: event.seq,
       time: event.time,
       pending: false,
@@ -362,6 +404,7 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
     kind: 'assistant',
     text: finalText,
     ...(finalReasoning !== '' ? { reasoning: finalReasoning } : {}),
+    ...(usage !== undefined ? { usage } : {}),
     seq: event.seq,
     time: event.time,
   }
@@ -562,4 +605,27 @@ export function foldEvents(events: readonly WireEvent[], existing?: readonly Ren
     applyEvent(state, event)
   }
   return [...state.messages].sort((a, b) => a.seq - b.seq || (a.id < b.id ? -1 : 1))
+}
+
+/**
+ * Track the session's context window from `request/context` events. Pure
+ * companion to {@link foldEvents}: callers feed the same event batches and
+ * keep the result; an advertisement only replaces `current` when its seq is
+ * newer, so older history pages never roll the window back.
+ *
+ * @param events - events to scan (any order).
+ * @param current - the previously tracked window, if any.
+ * @returns the latest advertised window, or `current` unchanged.
+ */
+export function latestContextWindow(events: readonly WireEvent[], current?: ContextWindow): ContextWindow | undefined {
+  let latest = current
+  for (const event of events) {
+    if (event.type !== 'request/context') continue
+    if (latest !== undefined && event.seq <= latest.seq) continue
+    const data = isRecord(event.data) ? event.data : {}
+    const window = pickNumber(data['contextWindow'])
+    if (window === undefined || window <= 0) continue
+    latest = { window, seq: event.seq }
+  }
+  return latest
 }

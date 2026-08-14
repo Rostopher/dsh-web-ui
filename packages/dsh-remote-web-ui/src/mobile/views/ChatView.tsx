@@ -18,7 +18,7 @@ import { loadHistory, prompt, type SessionView } from './App.tsx'
 import { errorText, formatTime, staleHostHint } from './App.tsx'
 import { models, selectModel, sendCommand } from '../api.ts'
 import { getDisplayOptions, setDisplayOptions, subscribeDisplayOptions } from '../display-options.ts'
-import { foldEvents, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
+import { foldEvents, latestContextWindow, type ContextWindow, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { MuxClient } from '../mux.ts'
 import { ThemeToggle } from '../theme-toggle.tsx'
 
@@ -121,6 +121,8 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const [sheet, setSheet] = useState<'model' | 'permission' | 'display' | null>(null)
   /** Chat display options (tool disclosures, host-injected messages). */
   const displayOptions = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
+  /** The session's advertised context window (latest request/context wins). */
+  const [contextWindow, setContextWindow] = useState<ContextWindow | undefined>(undefined)
 
   // Tail page on open (content loads only when the session is opened).
   useEffect(() => {
@@ -130,6 +132,7 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     setLoading(true)
     setError(undefined)
     setMessages([])
+    setContextWindow(undefined)
     void loadHistory(session.sessionId).then(
       (page) => {
         if (cancelled) return
@@ -138,7 +141,9 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         const buffered = liveBufferRef.current
         liveBufferRef.current = []
         tailLoadingRef.current = false
-        setMessages(foldEvents(buffered, foldEvents(page.events.map(eventOf))))
+        const pageEvents = page.events.map(eventOf)
+        setMessages(foldEvents(buffered, foldEvents(pageEvents)))
+        setContextWindow(latestContextWindow([...pageEvents, ...buffered]))
         setHasOlder(page.hasMore)
         setLoading(false)
         // The history-tail projection baseline seeds the permission picker.
@@ -153,7 +158,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         const buffered = liveBufferRef.current
         liveBufferRef.current = []
         tailLoadingRef.current = false
-        if (buffered.length > 0) setMessages(foldEvents(buffered))
+        if (buffered.length > 0) {
+          setMessages(foldEvents(buffered))
+          setContextWindow(latestContextWindow(buffered))
+        }
         setError(errorText(reason))
         setLoading(false)
       },
@@ -181,6 +189,7 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           return
         }
         setMessages(previous => foldEvents([event], previous))
+        setContextWindow(previous => latestContextWindow([event], previous))
         return
       }
       // Live projection pushes keep the permission picker current.
@@ -274,6 +283,19 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     ? messages
     : messages.filter(message => message.sourceKind === undefined)
 
+  // Context occupancy: the latest step's full prompt against the advertised
+  // window (the prompt the next request builds on). Hidden until both exist.
+  let contextPercent: number | undefined
+  if (contextWindow !== undefined) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const usage = messages[i]?.usage
+      if (usage === undefined) continue
+      const used = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+      contextPercent = Math.min(100, Math.round((used / contextWindow.window) * 100))
+      break
+    }
+  }
+
   return (
     <div className="chat">
       <header className="mobile-header">
@@ -309,6 +331,11 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           <span className="chat-chip-label">显示</span>
           <span className="chat-chip-chevron" aria-hidden>›</span>
         </button>
+        {contextPercent !== undefined && (
+          <span className={`chat-context${contextPercent >= 80 ? ' chat-context-high' : ''}`}>
+            上下文 {contextPercent}%
+          </span>
+        )}
       </div>
       <div className="chat-inputbar">
         <textarea
