@@ -21,7 +21,10 @@ packages/<name>/
 │   └── client.ts      # browser 半区（Web GUI 侧）
 ├── tsconfig.json
 ├── tsdown.config.ts
-└── README.md
+├── README.md          # 英文版（含 H1 后语言切换行）
+├── README.zh.md       # 中文版（结构与英文镜像）
+├── README.i18n.yaml   # 配对一致性记录（docs/i18n.md）
+└── AGENTS.md          # 包级 AI 指令（可选，复杂包建议写）
 ```
 
 ### 2. 实现插件逻辑
@@ -95,6 +98,16 @@ dsh plugin --profile web add link:<dsh-web-ui>/packages/dsh-web-ui-all
    - 在包 README 记录来源仓库与迁移日期；
    - 版权归原作者，本仓库仅托管，不主张版权。
 3. **合规红线**：无 LICENSE、作者未授权、或版权归属不明的代码，一律不收编。
+
+### 社区插件索引登记
+
+第三方插件作者可把自己的插件登记进「社区插件」卡片（设置 → 插件配置 → Web UI 插件），卡片列出条目并链接到作者自己的仓库：
+
+1. 在 `packages/dsh-web-ui-settings/community.json` 追加条目：`id` / `name` / `nameEn` / `author` / `repo`（https:// 仓库 URL）必填，`description` / `descriptionEn` / `npm` 可选；
+2. 运行 `node scripts/community-index` 重新生成注册表并提交生成的 `packages/dsh-web-ui-settings/src/client/generated/community.ts`；
+3. `pnpm community:check` 校验数据与生成物一致（CI 门禁）。
+
+索引只收录链接、不搬代码，条目版权归原作者，由维护者审核合并。
 
 ## 插件规范要点
 

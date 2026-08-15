@@ -31,6 +31,42 @@ const GIT_POLL_MS = 2_000
 /** SSE keep-alive comment interval (proxies drop idle connections). */
 const HEARTBEAT_MS = 15_000
 
+/**
+ * Loopback trust fence — the same judgment dsh-ssh applies to its host
+ * routes: a loopback socket address AND a loopback Host header, plus browser
+ * same-origin markers. The /aionui-panel operations read/write real workspace
+ * files and run git, so a LAN-exposed dsh web must not serve them to unpaired
+ * devices. The socket address is authoritative; X-Forwarded-For is never
+ * trusted (matching dsh-ssh).
+ */
+function isLoopbackRequest(request: IncomingMessage): boolean {
+  const address = request.socket.remoteAddress
+  if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
+  const host = request.headers.host
+  if (typeof host !== 'string') return false
+  let hostUrl: URL
+  try {
+    hostUrl = new URL(`http://${host}`)
+  } catch {
+    return false
+  }
+  if (hostUrl.hostname !== '127.0.0.1' && hostUrl.hostname !== 'localhost' && hostUrl.hostname !== '[::1]') return false
+  if (request.headers['sec-fetch-site'] === 'cross-site') return false
+  const origin = request.headers.origin
+  if (origin === undefined) return true
+  try {
+    return new URL(origin).host === hostUrl.host
+  } catch {
+    return false
+  }
+}
+
+/** Write the shared non-loopback rejection (same body as dsh-ssh). */
+function forbidden(res: ServerResponse): void {
+  res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify({ error: 'forbidden: loopback-only' }))
+}
+
 /** Read a JSON request body into an unknown value; null when unparseable. */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
@@ -98,16 +134,39 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   }
 
   let polling = false
+  // One-shot availability state: a machine without a git binary must not
+  // re-spawn ENOENT every 2s tick. The probe result is cached inside the git
+  // service, so this runs once, logs at most once, and then git polling stops
+  // for the rest of this route instance while fs watching keeps working.
+  let gitProbed = false
+  let gitUnavailable = false
   const pollGit = async (): Promise<void> => {
     // Guard against overlapping polls: a slow git status on a large repo must
     // not stack another run on the next 2s tick.
     if (polling) return
     polling = true
     try {
+      if (!gitProbed) {
+        gitProbed = true
+        if (!(await git.gitAvailable())) {
+          gitUnavailable = true
+          ctx.logger.warn('dsh-aionui-panel: git binary unavailable, SCM polling disabled')
+          for (const subscriber of subscribers) push(subscriber, { kind: 'gitUnavailable' })
+        }
+      }
+      if (gitUnavailable) return
       await Promise.all([...subscribers].map(async (subscriber) => {
         try {
-          const status = await git.status(subscriber.root)
-          if (status === null || typeof status === 'object' && 'code' in status) return
+          // Subscribers were gated when the stream opened, so use the
+          // canonical git methods (no double gate per 2s tick). repoOf inside
+          // them re-runs `rev-parse --show-toplevel` only after its TTL
+          // expires: a non-repo root never spawns a git status, and a repo
+          // created or removed while the host is running (git init / deleting
+          // .git) is still discovered by a later tick. The poll interval
+          // therefore keeps running while any subscriber is connected.
+          if (!(await git.isRepositoryCanonical(subscriber.root))) return
+          const status = await git.statusCanonical(subscriber.root)
+          if (status === null) return
           const key = `${status.branch}|${JSON.stringify(status.staged)}|${JSON.stringify(status.unstaged)}|${JSON.stringify(status.untracked)}`
           if (key === subscriber.lastGit) return
           subscriber.lastGit = key
@@ -150,6 +209,12 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   }
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    // Loopback fence first: never let a LAN client reach any /aionui-panel
+    // operation, regardless of method or content-type.
+    if (!isLoopbackRequest(req)) {
+      forbidden(res)
+      return
+    }
     if (req.method === 'GET') {
       const url = new URL(req.url ?? '/', 'http://x')
       if (url.pathname === '/aionui-panel/raw') {
@@ -290,6 +355,12 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
   }
 
   const sse = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    // Reject non-loopback clients before gating the root or opening the
+    // stream: a LAN-exposed deployment must not offer a subscription at all.
+    if (!isLoopbackRequest(req)) {
+      forbidden(res)
+      return
+    }
     const url = new URL(req.url ?? '/', 'http://x')
     const root = url.searchParams.get('root')
     if (root === null || root === '') {
@@ -313,6 +384,10 @@ export function registerPanelRoutes(ctx: Context, fs: FsService, git: GitService
     res.write('retry: 2000\n\n')
     const subscriber: Subscriber = { root: gated.canonical, lastGit: '', res }
     subscribers.add(subscriber)
+    // A stream opened after the one-shot probe already failed gets the
+    // unavailable event right away; streams open during the probe receive it
+    // from the probe's broadcast above.
+    if (gitUnavailable) push(subscriber, { kind: 'gitUnavailable' })
     if (gitTimer === undefined) gitTimer = setInterval(pollGit, GIT_POLL_MS)
     if (heartbeatTimer === undefined) {
       heartbeatTimer = setInterval(() => {

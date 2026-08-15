@@ -1,5 +1,7 @@
 # DSH Remote Web UI
 
+
+English | [中文](README.zh.md)
 > 移动端远程控制 + 一键远程更新：扫码配对后用手机远程使用当前 dsh web 工作区；
 > 点击侧边栏更新按钮自动检查并更新 dsh-web-ui 全家桶。
 
@@ -122,7 +124,9 @@ mounts both halves.
    - opening a session fetches its chat content **on demand** (history
      pages, "加载更早的消息" goes further back),
    - a live stream shows new messages as they arrive, with a prompt box
-     for sending your own,
+     for sending your own (**Enter sends and Shift+Enter inserts a newline
+     by default**; set `mobileEnterToSend: false` to make Enter insert a
+     newline and reserve sending for the 发送 button),
    - a **light-first theme**: the surface ships a light palette by default;
      a sun/moon toggle in every header flips to the dark palette and the
      choice persists across visits (localStorage),
@@ -159,6 +163,13 @@ over Server-Sent Events on `/m/api/events.mux`.
 
 ### Behavior notes
 
+- The mobile composer sends on Enter by default (Shift+Enter inserts a
+  newline). Set `mobileEnterToSend: false` in the plugin settings card (or
+  the profile patch) to make plain Enter insert a newline instead; sending
+  then happens only through the 发送 button. The phone reads the flag
+  through its own `/m/api` preferences method when a chat opens. On
+  browsers that support `field-sizing: content`, the input grows with the
+  draft up to its 120px cap in either mode.
 - Installing this plugin gates non-loopback `/api` access behind pairing
   (see `requirePairingForLan` in `src/index.ts`). A desktop browser opened
   via the LAN URL must pair like any remote device; loopback (127.0.0.1)

@@ -16,7 +16,7 @@ import type { MuxFrame } from '@deepseek-ai/dsh-host-apiproxy/api/events'
 import type { SessionModels } from '@deepseek-ai/dsh-host-apiproxy/api/sessions'
 import { loadHistory, prompt, type SessionView } from './App.tsx'
 import { errorText, formatTime, staleHostHint } from './App.tsx'
-import { models, selectModel, sendCommand } from '../api.ts'
+import { fetchMobilePreferences, models, selectModel, sendCommand } from '../api.ts'
 import { getDisplayOptions, setDisplayOptions, subscribeDisplayOptions } from '../display-options.ts'
 import { renderMarkdown } from '../markdown.ts'
 import { foldEvents, latestContextWindow, type ContextWindow, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
@@ -30,6 +30,13 @@ export interface ChatViewProps {
   mux?: MuxClient | undefined
   onBack(): void
 }
+
+/**
+ * Hard cap on live events buffered while the initial history tail page is in
+ * flight. Beyond this the oldest buffered event is dropped and a follow-up
+ * history tail re-pull closes the seam.
+ */
+export const MAX_TAIL_BUFFER_EVENTS = 500
 
 /** Extract the raw event from one history entry (the fold consumes events only). */
 function eventOf(entry: { event: WireEvent }): WireEvent {
@@ -113,6 +120,8 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const tailLoadingRef = useRef(true)
   /** Live session events buffered while the initial tail page loads. */
   const liveBufferRef = useRef<WireEvent[]>([])
+  /** True once the live buffer hit its cap (oldest events were dropped). */
+  const liveBufferOverflowRef = useRef(false)
 
   /** The session's permission select (absent = capability not composed). */
   const [permissions, setPermissions] = useState<PermissionSelectValue | undefined>(undefined)
@@ -124,17 +133,42 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const displayOptions = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
   /** The session's advertised context window (latest request/context wins). */
   const [contextWindow, setContextWindow] = useState<ContextWindow | undefined>(undefined)
+  /**
+   * Composer preference from the plugin's host settings (default true keeps
+   * the legacy Enter-to-send behavior until the preference loads).
+   */
+  const [mobileEnterToSend, setMobileEnterToSend] = useState(true)
+
+  // Read-only mobile display preferences ride the plugin's local
+  // `/m/api` method; a failure keeps the default (Enter sends).
+  useEffect(() => {
+    let cancelled = false
+    void fetchMobilePreferences().then(
+      (preferences) => {
+        if (!cancelled) setMobileEnterToSend(preferences.mobileEnterToSend !== false)
+      },
+      () => { /* keep the default */ },
+    )
+    return () => { cancelled = true }
+  }, [])
 
   // Tail page on open (content loads only when the session is opened).
   useEffect(() => {
     let cancelled = false
+    const controller = new AbortController()
+    // A stuck history load must not keep the chat empty (or the live buffer
+    // growing) forever: abort it and surface the transport error.
+    const timeout = setTimeout(() => {
+      controller.abort(new DOMException('history load timed out', 'TimeoutError'))
+    }, 15_000)
     tailLoadingRef.current = true
     liveBufferRef.current = []
+    liveBufferOverflowRef.current = false
     setLoading(true)
     setError(undefined)
     setMessages([])
     setContextWindow(undefined)
-    void loadHistory(session.sessionId).then(
+    void loadHistory(session.sessionId, undefined, controller.signal).then(
       (page) => {
         if (cancelled) return
         // Buffered live events re-fold on top of the snapshot; the watermark
@@ -152,6 +186,24 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         // plugin (augmentation), so the base SDK map is indexed loosely.
         const projections = page.projections?.values as Record<string, unknown> | undefined
         setPermissions(parsePermissionSelect(projections?.['permissions']))
+        // The buffer overflowed while waiting (oldest events were dropped), so
+        // re-pull the freshest history page to close the gap on top of what is
+        // already rendered. Best-effort: a failure here only logs, it must not
+        // replace the loaded state with an error.
+        if (liveBufferOverflowRef.current) {
+          void loadHistory(session.sessionId, undefined, controller.signal).then(
+            (fresh) => {
+              if (cancelled) return
+              setMessages(previous => foldEvents(fresh.events.map(eventOf), previous))
+              setContextWindow(previous => latestContextWindow(fresh.events.map(eventOf), previous))
+              liveBufferOverflowRef.current = false
+            },
+            (reason: unknown) => {
+              if (cancelled) return
+              console.warn('history tail re-pull after live buffer overflow failed', reason)
+            },
+          )
+        }
       },
       (reason: unknown) => {
         if (cancelled) return
@@ -175,7 +227,11 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
       },
       () => { /* chip falls back to a plain label */ },
     )
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      clearTimeout(timeout)
+      controller.abort()
+    }
   }, [session.sessionId])
 
   // Live frames: fold session events for this session in as they arrive.
@@ -186,6 +242,18 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         if (frame.sessionId !== session.sessionId) return
         const event = frame.event as WireEvent
         if (tailLoadingRef.current) {
+          if (liveBufferRef.current.length >= MAX_TAIL_BUFFER_EVENTS) {
+            // Bound the tail-load window: drop the oldest buffered event and
+            // remember that a follow-up history re-pull is needed. Warn once
+            // per load, not for every subsequent overflow.
+            liveBufferRef.current.shift()
+            if (!liveBufferOverflowRef.current) {
+              console.warn(
+                `history tail is slow: live buffer reached ${MAX_TAIL_BUFFER_EVENTS} events; oldest buffered events will be re-fetched`,
+              )
+              liveBufferOverflowRef.current = true
+            }
+          }
           liveBufferRef.current.push(event)
           return
         }
@@ -343,11 +411,11 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           className="chat-input"
           rows={1}
           value={input}
-          placeholder="输入消息，Enter 发送…"
-          enterKeyHint="send"
+          placeholder={mobileEnterToSend ? '输入消息，Enter 发送…' : '输入消息，Enter 换行，点按钮发送…'}
+          enterKeyHint={mobileEnterToSend ? 'send' : 'enter'}
           onChange={(event) => { setInput(event.target.value) }}
           onKeyDown={(event) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
+            if (mobileEnterToSend && event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
               void send()
             }

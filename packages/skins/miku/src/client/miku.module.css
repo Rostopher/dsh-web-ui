@@ -267,14 +267,14 @@ body[data-dsh-miku] {
   --dsw-alias-interactive-bg-hover-danger: rgba(194, 38, 38, 0.06);
   --dsw-alias-interactive-bg-hover-solid: #eaf4ff;
   --dsw-alias-interactive-bg-hover: rgba(46, 155, 255, 0.08);
-  --dsw-alias-label-caption: #8fa3c0;
-  --dsw-alias-label-dimmed: #a3b8d8;
+  --dsw-alias-label-caption: #5d74a0;
+  --dsw-alias-label-dimmed: #6880a5;
   --dsw-alias-label-primary-dimmed: #465a84;
   --dsw-alias-label-primary-foreground: #fff;
   --dsw-alias-label-primary-inverted: #fff;
   --dsw-alias-label-primary: #17302c;
   --dsw-alias-label-secondary: #465a84;
-  --dsw-alias-label-tertiary: #6c82a8;
+  --dsw-alias-label-tertiary: #5d74a0;
   --dsw-alias-markdown-citation: #e4f7f2;
   --dsw-alias-markdown-code-block-banner: #f3f8ff;
   --dsw-alias-markdown-code-block: #f3f8ff;
@@ -300,6 +300,7 @@ body[data-dsh-miku] {
   --dsw-alias-state-warn-tertiary: #fdf3dd;
   --dsw-alias-toast-bg: #1e6fd9;
   --dsw-alias-tooltip-bg: #ffffff;
+  --dsw-alias-tooltip-fg: #17302c;
   --dsw-specific-bubble-highlight: #cfe3ff;
   --dsw-specific-bubble: #e4f0ff;
   --dsw-specific-input-major: #fff;
@@ -392,6 +393,7 @@ body[data-dsh-miku][data-ds-dark-theme] {
   --dsw-alias-state-warn-tertiary: #3a3015;
   --dsw-alias-toast-bg: #1c3468;
   --dsw-alias-tooltip-bg: #213856;
+  --dsw-alias-tooltip-fg: #d6f1ec;
   --dsw-specific-bubble-highlight: #22407a;
   --dsw-specific-bubble: #162a52;
   --dsw-specific-input-major: #12244a;
@@ -713,34 +715,65 @@ body[data-dsh-miku][data-ds-dark-theme] [data-pane='sidebar'] > div {
   -webkit-backdrop-filter: blur(8px);
 }
 
-/* Sidebar header band: the first child (logo row) becomes the Miku teal
-   user strip with a glass sheen; everything inside renders white. */
+/* Live GUI wraps the sidebar; :first-child is the whole column, not the
+   logo. Neutralize that match with the same selectors so an already-installed
+   white-ink sheet cannot win. White stays on the logo row only. */
+body[data-dsh-miku] [data-pane='sidebar'] {
+  color: var(--dsw-alias-label-primary);
+}
+
 body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child,
 body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child * {
-  color: #fff;
+  color: var(--dsw-alias-label-primary);
 }
 
 body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child {
+  background: none;
+  border-bottom: none;
+  box-shadow: none;
+}
+
+body[data-dsh-miku][data-ds-dark-theme] [data-pane='sidebar'] > div > :first-child {
+  background: none;
+  border-bottom: none;
+  box-shadow: none;
+}
+
+body[data-dsh-miku] [data-pane='sidebar'] [class*='sessionRow'] {
+  color: var(--dsw-alias-label-primary);
+}
+
+body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child [role='dialog'] {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Sidebar header band: only the logo row is the Miku user strip. */
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'],
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] * {
+  color: #fff;
+}
+
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.24), rgba(255, 255, 255, 0) 60%), linear-gradient(90deg, #1e6fd9 0%, #2e9bff 45%, #9b5dff 72%, #ff4da6 100%);
   border-bottom: 1px solid #0d2e66;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
 }
 
-body[data-dsh-miku][data-ds-dark-theme] [data-pane='sidebar'] > div > :first-child {
+body[data-dsh-miku][data-ds-dark-theme] [data-pane='sidebar'] [class*='logoRow'] {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 60%), linear-gradient(180deg, #0d2b56, #14564f);
   border-bottom-color: #062e2a;
 }
 
 /* Header-band buttons stay flat and transparent (no silver squares on the
    teal strip). */
-body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child button {
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] button {
   background: transparent;
   color: #fff;
   background-image: none;
   box-shadow: none;
 }
 
-body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child button:hover {
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] button:hover {
   background: rgba(255, 255, 255, 0.18);
 }
 
@@ -749,11 +782,11 @@ body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child button:hover {
    the inverted-primary token —white on white in light mode, invisible.
    Pin the pill to the deep teal and force the letters white in both
    themes, so the badge reads on the teal strip. */
-body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child svg rect[fill='currentColor'] {
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] svg rect[fill='currentColor'] {
   fill: #0d2b56;
 }
 
-body[data-dsh-miku] [data-pane='sidebar'] > div > :first-child svg [fill='var(--dsw-alias-label-primary-inverted)'] {
+body[data-dsh-miku] [data-pane='sidebar'] [class*='logoRow'] svg [fill='var(--dsw-alias-label-primary-inverted)'] {
   fill: #fff;
 }
 
@@ -793,6 +826,37 @@ body[data-dsh-miku][data-ds-dark-theme] [data-pane='details'] {
   -webkit-backdrop-filter: blur(8px);
 }
 
+body[data-dsh-miku] [role='tooltip'] {
+  background: var(--dsw-alias-tooltip-bg);
+  color: var(--dsw-alias-tooltip-fg);
+}
+
+body[data-dsh-miku] [role='dialog'] {
+  color: var(--dsw-alias-label-primary);
+}
+
+body[data-dsh-miku] [role='dialog'] [class*='navCell']:not([aria-current='true']) {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Text tabs are labels, not glassy teal plates. */
+body[data-dsh-miku] button[role='tab'],
+body[data-dsh-miku] button[role='tab']:hover,
+body[data-dsh-miku] button[role='tab']:active,
+body[data-dsh-miku] button[role='tab']:disabled,
+body[data-dsh-miku] button[role='tab']:hover:not(:disabled),
+body[data-dsh-miku] button[role='tab']:active:not(:disabled) {
+  background-image: none;
+  background-color: transparent;
+  box-shadow: none;
+  text-shadow: none;
+  border: 0;
+  color: var(--dsw-alias-label-primary);
+  transform: none;
+  filter: none;
+  opacity: 1;
+}
+
 /* --- aionui 右侧面板适配（dsh-aionui-panel） ---
    The aionui-panel host plugin paints its Explorer / SCM / Preview panes
    from an independent --aion-* token system (defined on :root in light and
@@ -816,8 +880,8 @@ body[data-dsh-miku] {
   --aion-bg-active: #e4f0ff;
   --aion-text-primary: #17302c;
   --aion-text-secondary: #465a84;
-  --aion-text-tertiary: #6c82a8;
-  --aion-text-disabled: #a3b8d8;
+  --aion-text-tertiary: #5d74a0;
+  --aion-text-disabled: #6880a5;
   --aion-primary: #2e9bff;
   --aion-primary-hover: #4da3ff;
   --aion-success: #24924a;
@@ -1616,7 +1680,7 @@ body[data-dsh-miku][data-ds-dark-theme] [class*='menu'] [class*='heading'] {
 /* Menu disabled items. */
 body[data-dsh-miku] [class*='menu'] [class*='disabled'],
 body[data-dsh-miku] [role='menuitem'][aria-disabled='true'] {
-  color: #a3b8d8 !important;
+  color: #5d74a0 !important;
   opacity: 0.6;
 }
 
