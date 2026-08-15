@@ -79,6 +79,9 @@ const promptMock = vi.mocked(prompt)
 beforeEach(() => {
   fetchMobilePreferencesMock.mockResolvedValue({ mobileEnterToSend: true })
   promptMock.mockResolvedValue(undefined)
+  // The display-option store is module-level: restore both defaults so a
+  // toggle in one test cannot leak into the next describe.
+  setDisplayOptions({ showTools: true, showSystemMessages: false })
   modelsMock.mockResolvedValue({
     current: { provider: 'fx', model: 'fx-1' },
     routable: true,
