@@ -16,6 +16,8 @@
  */
 
 import { randomBytes } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 /** The observable pairing phases the panel renders. */
 export type PairingPhase =
@@ -95,6 +97,14 @@ export interface PairingConfig {
   maxDevices: number
   /** Cookie name carrying the device id. */
   cookieName: string
+  /**
+   * When set, the paired-device table persists to this JSON file and is
+   * reloaded at construction, so paired phones survive a host restart
+   * (their cookie still names a known device). Tokens stay memory-only —
+   * they are one-time and short-lived by design. Unset keeps the legacy
+   * memory-only behavior.
+   */
+  devicesFile?: string
 }
 
 /** Result of one accept() attempt. */
@@ -154,7 +164,45 @@ export class PairingService {
   constructor(
     public config: PairingConfig,
     private readonly clock: PairingClock = defaultClock,
-  ) {}
+  ) {
+    this.loadDevices()
+  }
+
+  /** Reload the persisted device table (construction only; tolerates a
+   *  missing or corrupt file — a state-file problem must not wedge the host). */
+  private loadDevices(): void {
+    const file = this.config.devicesFile
+    if (file === undefined || !existsSync(file)) return
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
+      if (typeof parsed !== 'object' || parsed === null) return
+      const table = (parsed as Record<string, unknown>)['devices']
+      if (typeof table !== 'object' || table === null || Array.isArray(table)) return
+      for (const [id, session] of Object.entries(table as Record<string, unknown>)) {
+        if (typeof session !== 'object' || session === null) continue
+        const createdAt = (session as Record<string, unknown>)['createdAt']
+        const lastSeenAt = (session as Record<string, unknown>)['lastSeenAt']
+        if (typeof createdAt !== 'number' || typeof lastSeenAt !== 'number') continue
+        this.devices.set(id, { createdAt, lastSeenAt })
+      }
+    } catch (error) {
+      console.warn('remote-web-ui: paired-devices file unreadable, starting with an empty device table', error)
+    }
+  }
+
+  /** Persist the device table atomically (tmp + rename, owner-only file). */
+  private persistDevices(): void {
+    const file = this.config.devicesFile
+    if (file === undefined) return
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      const tmp = `${file}.${String(process.pid)}.tmp`
+      writeFileSync(tmp, JSON.stringify({ devices: Object.fromEntries(this.devices) }), { mode: 0o600 })
+      renameSync(tmp, file)
+    } catch (error) {
+      console.warn('remote-web-ui: failed to persist the paired-device table', error)
+    }
+  }
 
   /** The default LAN base URL (the first interface; undefined when not LAN-reachable). */
   get lanBaseUrl(): string | undefined {
@@ -254,6 +302,7 @@ export class PairingService {
       if (oldest !== undefined) this.devices.delete(oldest.id)
     }
     this.devices.set(deviceId, { createdAt: now, lastSeenAt: now })
+    this.persistDevices()
     this.notify()
     return { ok: true, deviceId }
   }
@@ -267,6 +316,7 @@ export class PairingService {
     this.tokens.clear()
     this.devices.clear()
     this.stopped = true
+    this.persistDevices()
     this.notify()
   }
 

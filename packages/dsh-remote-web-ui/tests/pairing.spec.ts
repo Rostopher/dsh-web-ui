@@ -1,5 +1,8 @@
 /** PairingService semantics: one-time tokens, expiry, refresh, stop, presence. */
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PairingService, UnknownLanAddressError, type PairingConfig } from '../src/pairing.ts'
 
 function makeService(overrides: Partial<PairingConfig> = {}) {
@@ -196,5 +199,64 @@ describe('PairingService', () => {
     expect(service.hasDevice(bId)).toBe(true)
     expect(service.hasDevice(cId)).toBe(true)
     expect(service.snapshot().deviceCount).toBe(2)
+  })
+})
+
+describe('PairingService device-table persistence', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dsh-pairing-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const file = (): string => join(dir, 'paired-devices.json')
+
+  it('reloads the paired-device table across instances (a restart needs no re-pairing)', () => {
+    const first = makeService({ devicesFile: file() })
+    const { token } = first.issue()
+    const accepted = first.accept(token)
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+
+    // A fresh service over the same file simulates a host restart.
+    const restarted = makeService({ devicesFile: file() })
+    expect(restarted.hasDevice(deviceId)).toBe(true)
+    expect(restarted.touchDevice(deviceId)).toBe(true)
+    expect(restarted.snapshot().deviceCount).toBe(1)
+  })
+
+  it('stop() revokes the persisted table too', () => {
+    const first = makeService({ devicesFile: file() })
+    const { token } = first.issue()
+    const accepted = first.accept(token)
+    const deviceId = accepted.ok ? accepted.deviceId : ''
+    first.stop()
+
+    const restarted = makeService({ devicesFile: file() })
+    expect(restarted.hasDevice(deviceId)).toBe(false)
+    expect(restarted.snapshot().deviceCount).toBe(0)
+  })
+
+  it('tolerates a corrupt devices file and starts empty', () => {
+    writeFileSync(file(), '{ not json', 'utf8')
+    const service = makeService({ devicesFile: file() })
+    expect(service.snapshot().deviceCount).toBe(0)
+    // …and recovers by overwriting on the next accept.
+    const { token } = service.issue()
+    expect(service.accept(token).ok).toBe(true)
+    const restarted = makeService({ devicesFile: file() })
+    expect(restarted.snapshot().deviceCount).toBe(1)
+  })
+
+  it('stays memory-only when no devicesFile is configured', () => {
+    const first = makeService()
+    const { token } = first.issue()
+    first.accept(token)
+    expect(existsSync(file())).toBe(false)
+    const second = makeService()
+    expect(second.snapshot().deviceCount).toBe(0)
   })
 })
