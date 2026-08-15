@@ -11,12 +11,13 @@
  *   permission pickers, both as bottom sheets.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { MuxFrame } from '@deepseek-ai/dsh-host-apiproxy/api/events'
 import type { SessionModels } from '@deepseek-ai/dsh-host-apiproxy/api/sessions'
 import { loadHistory, prompt, type SessionView } from './App.tsx'
 import { errorText, formatTime, staleHostHint } from './App.tsx'
 import { models, selectModel, sendCommand } from '../api.ts'
+import { renderMarkdown } from '../markdown.ts'
 import { foldEvents, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { MuxClient } from '../mux.ts'
 import { ThemeToggle } from '../theme-toggle.tsx'
@@ -325,7 +326,7 @@ function MessageRow({ message }: { message: RenderMessage }) {
       {message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0 && (
         <ToolDisclosure tools={message.tools} />
       )}
-      <CollapsibleText text={message.text} />
+      <CollapsibleBody text={message.text} markdown={message.kind === 'assistant'} />
       {message.failed === true && <span className="chat-msg-failtag">本次回复失败</span>}
       <span className="chat-msg-time">{formatTime(message.time)}</span>
     </div>
@@ -384,21 +385,32 @@ function ToolDisclosure({ tools }: { tools: ToolCallInfo[] }) {
   )
 }
 
-/** Long assistant text collapses behind an explicit expand toggle. */
-function CollapsibleText({ text }: { text: string }) {
+/** Long message bodies collapse behind an explicit expand toggle. Assistant
+ *  text renders as Markdown (the collapsed preview slices the raw source, so
+ *  a cut mid-construct degrades to literal text — acceptable for a preview);
+ *  user prompts stay plain. */
+function CollapsibleBody({ text, markdown }: { text: string; markdown: boolean }) {
   const [open, setOpen] = useState(false)
   if (text.length <= LONG_TEXT_LIMIT) {
-    return <span className="chat-msg-text">{text}</span>
+    return markdown
+      ? <MarkdownText text={text} />
+      : <span className="chat-msg-text">{text}</span>
   }
   const shown = open ? text : text.slice(0, LONG_TEXT_PREVIEW)
   return (
-    <span className="chat-msg-text">
-      {shown}{!open ? '…' : ''}
+    <div className="chat-msg-text">
+      {markdown ? <MarkdownText text={shown} /> : shown}{!open ? '…' : ''}
       <button type="button" className="chat-msg-toggle" onClick={() => { setOpen(value => !value) }}>
         {open ? '收起' : `展开全文（${text.length} 字）`}
       </button>
-    </span>
+    </div>
   )
+}
+
+/** Sanitized Markdown body of one assistant message. */
+function MarkdownText({ text }: { text: string }) {
+  const html = useMemo(() => renderMarkdown(text), [text])
+  return <div className="chat-msg-text chat-md" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 const LONG_TEXT_LIMIT = 1600

@@ -130,6 +130,20 @@ describe('ChatView message folds', () => {
     expect(screen.getByText('bash')).toBeTruthy()
   })
 
+  it('renders assistant text as Markdown (headings, emphasis)', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: '## 结论\n\n**加粗**' }] },
+      }, 0),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByRole('heading', { level: 2, name: '结论' })).toBeTruthy()
+    expect(screen.getByText('加粗').tagName).toBe('STRONG')
+  })
+
   it('shows the permission chip from the history-tail projection and applies via /permission', async () => {
     loadHistoryMock.mockResolvedValue(historyPage(turnEvents(), {
       projections: {

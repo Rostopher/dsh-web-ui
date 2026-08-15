@@ -393,6 +393,111 @@ body {
   cursor: pointer;
 }
 
+/* ── markdown body (assistant messages) ───────────────────────────────── */
+
+.chat-md {
+  white-space: normal;
+}
+
+.chat-md p {
+  margin: 0 0 8px;
+}
+
+.chat-md p:last-child {
+  margin-bottom: 0;
+}
+
+.chat-md h1,
+.chat-md h2,
+.chat-md h3,
+.chat-md h4 {
+  margin: 12px 0 6px;
+  line-height: 1.35;
+}
+
+.chat-md h1 { font-size: 1.25em; }
+.chat-md h2 { font-size: 1.18em; }
+.chat-md h3 { font-size: 1.1em; }
+.chat-md h4 { font-size: 1em; }
+
+.chat-md h1:first-child,
+.chat-md h2:first-child,
+.chat-md h3:first-child,
+.chat-md h4:first-child {
+  margin-top: 0;
+}
+
+.chat-md ul,
+.chat-md ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.chat-md li {
+  margin: 2px 0;
+}
+
+.chat-md code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--m-bg-input);
+  font-size: 0.92em;
+}
+
+.chat-md pre {
+  margin: 8px 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--m-bg-input);
+  overflow-x: auto;
+}
+
+.chat-md pre code {
+  padding: 0;
+  background: none;
+}
+
+.chat-md blockquote {
+  margin: 8px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--m-border);
+  color: var(--m-text-secondary);
+}
+
+.chat-md table {
+  display: block;
+  margin: 8px 0;
+  border-collapse: collapse;
+  overflow-x: auto;
+  font-size: 0.92em;
+}
+
+.chat-md th,
+.chat-md td {
+  padding: 4px 8px;
+  border: 1px solid var(--m-border);
+}
+
+.chat-md a {
+  color: var(--m-accent);
+}
+
+.chat-md hr {
+  margin: 10px 0;
+  border: none;
+  border-top: 1px solid var(--m-border);
+}
+
+.chat-md img {
+  max-width: 100%;
+}
+
+.chat-md .katex-display {
+  padding: 4px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
 /* ── message disclosures (reasoning / tools) ─────────────────────────── */
 
 .chat-disclosure {
