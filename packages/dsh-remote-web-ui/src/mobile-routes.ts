@@ -10,6 +10,8 @@
 
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
@@ -24,7 +26,12 @@ function touchIconPath(): string {
   return fileURLToPath(new URL('../assets/apple-touch-icon.png', import.meta.url))
 }
 
-/** The mobile page shell: minimal, offline-safe, one local icon asset. */
+/** The installed katex package root (stylesheet + fonts served from disk). */
+function katexRoot(): string {
+  return dirname(createRequire(import.meta.url).resolve('katex/package.json'))
+}
+
+/** The mobile page shell: minimal, offline-safe, local assets only. */
 function pageHtml(bundleUrl: string): string {
   return [
     '<!doctype html>',
@@ -36,6 +43,8 @@ function pageHtml(bundleUrl: string): string {
     '<meta name="referrer" content="no-referrer">',
     // iOS "Add to Home Screen" icon (the dsh whale on the light theme color).
     '<link rel="apple-touch-icon" href="/m/apple-touch-icon.png">',
+    // KaTeX math rendering (fonts resolve relative to this URL at /m/fonts/).
+    '<link rel="stylesheet" href="/m/katex.css">',
     '<title>移动端远程控制</title>',
     '</head>',
     '<body>',
@@ -56,7 +65,7 @@ function writeStatic(res: ServerResponse, status: number, type: string, body: st
   res.end(body)
 }
 
-/** Send a small binary body (the touch icon); no charset, longer cache is safe. */
+/** Send a small binary body (icon, fonts); no charset, immutable content. */
 function writeBinary(res: ServerResponse, status: number, type: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': type,
@@ -64,6 +73,13 @@ function writeBinary(res: ServerResponse, status: number, type: string, body: Bu
     'referrer-policy': 'no-referrer',
   })
   res.end(body)
+}
+
+/** Font MIME types served under /m/fonts/ (the set KaTeX's stylesheet references). */
+const FONT_TYPES: Record<string, string> = {
+  '.woff2': 'font/woff2',
+  '.woff': 'font/woff',
+  '.ttf': 'font/ttf',
 }
 
 /**
@@ -95,9 +111,33 @@ export function makeMobileRoutes(): WebRoute[] {
       writeStatic(res, 404, 'text/plain', 'apple-touch-icon not found')
     }
   }
+  const handleKatexCss = async (_req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      const body = await readFile(join(katexRoot(), 'dist', 'katex.min.css'), 'utf8')
+      writeStatic(res, 200, 'text/css', body)
+    } catch {
+      writeStatic(res, 404, 'text/plain', 'katex stylesheet not found')
+    }
+  }
+  const handleFont = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    // Prefix route: serve one font file from the katex package by bare name.
+    const name = (req.url ?? '').slice('/m/fonts/'.length).split('?')[0] ?? ''
+    const type = FONT_TYPES[extname(name)]
+    if (!/^[\w.-]+$/.test(name) || type === undefined) {
+      writeStatic(res, 404, 'text/plain', 'font not found')
+      return
+    }
+    try {
+      writeBinary(res, 200, type, await readFile(join(katexRoot(), 'dist', 'fonts', name)))
+    } catch {
+      writeStatic(res, 404, 'text/plain', 'font not found')
+    }
+  }
   return [
     { kind: 'exact', path: '/m', handler: handlePage },
     { kind: 'exact', path: '/m/mobile.js', handler: handleBundle },
     { kind: 'exact', path: '/m/apple-touch-icon.png', handler: handleTouchIcon },
+    { kind: 'exact', path: '/m/katex.css', handler: handleKatexCss },
+    { kind: 'prefix', path: '/m/fonts', handler: handleFont },
   ]
 }

@@ -60,7 +60,11 @@
     "clsx": "^2.1.1",
     "qrcode.react": "^4.2.0",
     "schemastery": "^3.18.0",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "dompurify": "^3.2.4",
+    "katex": "^0.16.22",
+    "marked": "^15.0.0",
+    "marked-katex-extension": "^5.1.5"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.6",
