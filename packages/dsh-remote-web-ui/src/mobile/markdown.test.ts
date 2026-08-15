@@ -14,6 +14,8 @@ describe('renderMarkdown', () => {
 
   it('renders inline and display math through KaTeX', () => {
     expect(renderMarkdown('质能方程 $E = mc^2$ 成立')).toContain('class="katex"')
+    // CJK-adjacent delimiters (no whitespace boundaries) must also parse.
+    expect(renderMarkdown('行内公式：$E=mc^2$。')).toContain('class="katex"')
     expect(renderMarkdown('$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$')).toContain('katex-display')
   })
 

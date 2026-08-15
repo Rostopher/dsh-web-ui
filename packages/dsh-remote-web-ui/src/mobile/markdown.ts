@@ -12,7 +12,9 @@ import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import markedKatex from 'marked-katex-extension'
 
-marked.use(markedKatex({ throwOnError: false }))
+// nonStandard: model output embeds $...$ in CJK text without whitespace
+// boundaries ("公式：$E=mc^2$。"), which the standard delimiter rule rejects.
+marked.use(markedKatex({ throwOnError: false, nonStandard: true }))
 marked.setOptions({ gfm: true, breaks: true })
 
 /**
