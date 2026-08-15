@@ -30,7 +30,12 @@ actions, and the update panel that probes and runs the update.
 - **Security**: one active one-time token (a refresh invalidates the old
   link; an accepted token cannot be reused; tokens expire). 停止 revokes
   every paired device and the current token — paired devices are cut off on
-  their next request. When the plugin's `requirePairingForLan` gate is on
+  their next request. Paired-device sessions persist across host restarts by
+  default: the device table is written owner-only to
+  `~/.dsh/remote-web-ui/paired-devices.json` and reloaded at startup, so a
+  restart no longer forces re-pairing (`persistDevices: false` restores the
+  legacy restart-revokes behavior; `devicesFile` relocates the file). When
+  the plugin's `requirePairingForLan` gate is on
   (default), every non-loopback `/api` request must carry a live paired
   device cookie, so the QR is the only way into a LAN-exposed dsh web.
 - **Live status**: the desktop panel mirrors the pairing state in real time

@@ -9,6 +9,8 @@
  */
 
 import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { setInterval as nodeSetInterval } from 'node:timers'
 import type { IncomingMessage } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
@@ -103,6 +105,20 @@ export interface Config {
    * sends (Shift+Enter keeps inserting a newline).
    */
   mobileEnterToSend?: boolean
+  /**
+   * When true (default), the paired-device table persists to `devicesFile`
+   * and is reloaded at startup, so paired phones keep working across a host
+   * restart instead of requiring a fresh QR. Set false for the legacy
+   * memory-only behavior (restart revokes every device).
+   */
+  persistDevices?: boolean
+  /**
+   * JSON file the paired-device table persists to (default
+   * `~/.dsh/remote-web-ui/paired-devices.json`, written owner-only). The
+   * file holds bearer device ids — treat it like any session store.
+   * Ignored while `persistDevices` is false.
+   */
+  devicesFile?: string
   /** Master switch for the plugin (browser half + host pairing surfaces). */
   enabled?: boolean
 }
@@ -116,6 +132,8 @@ export const Config: z<Config> = z.object({
   publicBaseUrl: z.string(),
   autoTunnel: z.boolean().default(false),
   mobileEnterToSend: z.boolean().default(true),
+  persistDevices: z.boolean().default(true),
+  devicesFile: z.string(),
   enabled: z.boolean().default(true),
 })
 
@@ -123,11 +141,19 @@ export const Config: z<Config> = z.object({
 const SWEEP_INTERVAL_MS = 10_000
 
 /**
- * Fully resolved config: every field non-optional except `publicBaseUrl`,
- * which legitimately resolves to `undefined` when unset (the schema keeps it
- * optional, so `Required` alone would over-narrow it to `string`).
+ * Fully resolved config: every field non-optional except `publicBaseUrl` and
+ * `devicesFile`, which legitimately resolve to `undefined` when unset (the
+ * schema keeps them optional, so `Required` alone would over-narrow them).
  */
-type ResolvedConfig = Required<Omit<Config, 'publicBaseUrl'>> & { publicBaseUrl: string | undefined }
+type ResolvedConfig = Required<Omit<Config, 'publicBaseUrl' | 'devicesFile'>> & {
+  publicBaseUrl: string | undefined
+  devicesFile: string | undefined
+}
+
+/** The default paired-device table location (the dsh user dir). */
+function defaultDevicesFile(): string {
+  return join(homedir(), '.dsh', 'remote-web-ui', 'paired-devices.json')
+}
 
 /** Schema defaults, re-read for hand-built test contexts (the loader applies them normally). */
 const DEFAULTS: ResolvedConfig = {
@@ -139,6 +165,8 @@ const DEFAULTS: ResolvedConfig = {
   publicBaseUrl: undefined,
   autoTunnel: false,
   mobileEnterToSend: true,
+  persistDevices: true,
+  devicesFile: undefined,
   enabled: true,
 }
 
@@ -157,6 +185,8 @@ export function apply(ctx: Context, config?: Config): void {
     publicBaseUrl: config?.publicBaseUrl,
     autoTunnel: config?.autoTunnel ?? DEFAULTS.autoTunnel,
     mobileEnterToSend: config?.mobileEnterToSend ?? DEFAULTS.mobileEnterToSend,
+    persistDevices: config?.persistDevices ?? DEFAULTS.persistDevices,
+    devicesFile: config?.devicesFile,
     enabled: config?.enabled ?? DEFAULTS.enabled,
   }
   // The live source the pairing service and the gate read: the settings
@@ -174,6 +204,8 @@ export function apply(ctx: Context, config?: Config): void {
       publicBaseUrl: value.publicBaseUrl,
       autoTunnel: value.autoTunnel ?? DEFAULTS.autoTunnel,
       mobileEnterToSend: value.mobileEnterToSend ?? DEFAULTS.mobileEnterToSend,
+      persistDevices: value.persistDevices ?? DEFAULTS.persistDevices,
+      devicesFile: value.devicesFile,
       enabled: value.enabled ?? DEFAULTS.enabled,
     }
   }
@@ -182,6 +214,7 @@ export function apply(ctx: Context, config?: Config): void {
     offlineAfterMs: resolved.offlineAfterMs,
     maxDevices: resolved.maxDevices,
     cookieName: resolved.cookieName,
+    devicesFile: resolved.persistDevices ? (resolved.devicesFile ?? defaultDevicesFile()) : undefined,
   })
 
   // ── auto tunnel ─────────────────────────────────────────────────────────
@@ -292,6 +325,7 @@ export function apply(ctx: Context, config?: Config): void {
       offlineAfterMs: value.offlineAfterMs,
       maxDevices: value.maxDevices,
       cookieName: value.cookieName,
+      devicesFile: value.persistDevices ? (value.devicesFile ?? defaultDevicesFile()) : undefined,
     }
     // The auto tunnel owns the public base while enabled: the minted URL
     // lands in the service through the tunnel's phase listener. The manual
