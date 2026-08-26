@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-/** The phone-side boot flow: pair accept, deep link params, URL stripping. */
+/** The phone-side boot flow: pair accept and deep link params. */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PAIR_FAILED_MARKER, runPairBootFlow, type PageSurface } from '../src/client/deep-link.ts'
-import { readPairParams, stripParam } from '../src/client/pair-api.ts'
+import { readPairParams } from '../src/client/pair-api.ts'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -38,13 +38,6 @@ describe('readPairParams', () => {
   })
 })
 
-describe('stripParam', () => {
-  it('returns the search without the named parameter (pure read)', () => {
-    window.history.replaceState(null, '', '/?pair=tok-1&workspace=ws-7')
-    expect(stripParam('pair')).toBe('?workspace=ws-7')
-    expect(stripParam('workspace')).toBe('?pair=tok-1')
-  })
-})
 
 describe('runPairBootFlow', () => {
   it('accepts the token and reloads (workspace param survives)', async () => {
@@ -70,7 +63,7 @@ describe('runPairBootFlow', () => {
     vi.stubGlobal('fetch', fetch)
     const ctx = { get: () => undefined }
     runPairBootFlow(ctx as never, '?pair=tok-1', page)
-    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/m'))
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/m/'))
     expect(reload).not.toHaveBeenCalled()
     expect(replaceState).toHaveBeenCalledWith('/')
   })
@@ -84,7 +77,7 @@ describe('runPairBootFlow', () => {
 
     runPairBootFlow(ctx as never, '?pair=tok-1&workspace=ws-7', page)
 
-    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/m?workspace=ws-7'))
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/m/?workspace=ws-7'))
     expect(replaceState).toHaveBeenCalledWith('/?workspace=ws-7')
   })
 

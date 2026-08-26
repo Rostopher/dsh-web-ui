@@ -11,32 +11,36 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subprocess'
-import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
+import { subprocessRunner as sharedSubprocessRunner, type GitRunner } from './git-runner.ts'
 import {
   checkRefFormatArgv, classifySwitchFailure, createBranchArgv, forEachRefArgv,
-  gitPathArgv, graphLogArgv, headBranchArgv, headShortArgv, OPERATION_MARKERS,
-  statusPorcelainArgv, switchArgv, topLevelArgv, unmergedArgv, validateBranchName,
-  verifyRefArgv, worktreeListArgv,
+  gitPathArgv, graphLogArgv, headBranchArgv, headShortArgv, operationMarkersArgv,
+  OPERATION_MARKERS, statusPorcelainArgv, switchArgv, topLevelArgv, unmergedArgv,
+  validateBranchName, verifyRefArgv, worktreeListArgv,
 } from '../core/git-command.ts'
 import {
   parseBranches, parseGraph, parsePorcelain, parseWorktreeBranches,
   type BranchesView, type GitError, type GraphView, type RepoStatus, type SwitchResult,
 } from '../core/types.ts'
 
-/** One finished git invocation. */
-export interface GitRunResult {
-  exitCode: number | null
-  stdout: string
-  stderr: string
-}
+/** One finished git invocation (shared runner plumbing). */
+export type { GitRunResult, GitRunner } from './git-runner.ts'
 
-/** The spawn seam the service runs git through (subprocess service in production). */
-export interface GitRunner {
-  run(argv: readonly string[], cwd: string): Promise<GitRunResult>
+/**
+ * Build the argv for one git invocation, with the win32 binary variant.
+ * Windows ships git as git.exe (git for Windows); a .cmd/.bat shim in PATH
+ * would otherwise be the resolution target and Node's spawn cannot launch
+ * a .cmd file directly (the dsh-subprocess seam applies no shell). Naming
+ * git.exe bypasses any shim and always hits the native executable. cmd.exe
+ * routing is deliberately NOT used: several git args carry %-format specs
+ * (for-each-ref/log --format) that cmd would expand and corrupt.
+ * @param platform - the process platform (process.platform in production; a test seam).
+ * @param argv - the git subcommand args.
+ * @returns the full spawn argv, starting with the platform git binary.
+ */
+export function gitSpawnArgv(platform: NodeJS.Platform, argv: readonly string[]): readonly string[] {
+  return platform === 'win32' ? ['git.exe', ...argv] : ['git', ...argv]
 }
-
-/** Collected-output cap for one git command (branch lists and logs fit comfortably). */
-const OUTPUT_CAP_BYTES = 1 << 20
 
 /** The workspace-membership verdict type. */
 export type WorkspaceVerdict = { ok: true; canonical: string } | { ok: false; error: GitError }
@@ -50,31 +54,13 @@ export type WorkspaceVerdict = { ok: true; canonical: string } | { ok: false; er
 export type WorkspaceGate = (path: string) => Promise<WorkspaceVerdict>
 
 /**
- * Production runner over `ctx.subprocess`: one managed child per command,
- * bounded collect on both streams, tree-scoped teardown on abort.
+ * Production runner over `ctx.subprocess`: shared plumbing with the win32
+ * git.exe argv variant.
  * @param ctx - context carrying the subprocess service.
  * @returns the runner.
  */
 export function subprocessRunner(ctx: Context): GitRunner {
-  return {
-    async run(argv, cwd) {
-      const spec: SubprocessSpawnSpec = {
-        argv: ['git', ...argv],
-        cwd,
-        stdio: {
-          stdin: 'ignore',
-          stdout: { maxBytes: OUTPUT_CAP_BYTES },
-          stderr: { maxBytes: OUTPUT_CAP_BYTES },
-        },
-        graceMs: 10_000,
-      }
-      const handle = ctx.subprocess.spawn(spec)
-      const outcome = await handle.done
-      const stdout = handle.collected.stdout?.readFrom(0).text ?? ''
-      const stderr = handle.collected.stderr?.readFrom(0).text ?? ''
-      return { exitCode: outcome.exitCode, stdout, stderr }
-    },
-  }
+  return sharedSubprocessRunner(ctx, { spawnArgv: (argv) => gitSpawnArgv(process.platform, argv) })
 }
 
 /** HEAD is the symbolic value `git rev-parse --abbrev-ref HEAD` prints when detached. */
@@ -101,51 +87,109 @@ export class GitService {
     private readonly gate: WorkspaceGate,
   ) {}
 
-  /** The repository snapshot the branch chip renders; null when not a repository. */
-  async status(path: string): Promise<RepoStatus | null> {
+  /** Status work currently running for each requested workspace path. */
+  private readonly statusFlights = new Map<string, Promise<RepoStatus | null>>()
+
+  /**
+   * The plumbing every read view shares: gate, repo root, current branch, and
+   * the porcelain counts + operation marker. Null when the path is not a
+   * usable repository (the workspace-gate semantics both views keep).
+   */
+  private async snapshot(path: string, signal?: AbortSignal): Promise<{
+    root: string
+    branch: string
+    counts: ReturnType<typeof parsePorcelain>
+    operationInProgress: boolean
+  } | null> {
     const gated = await this.gate(path)
     if (!gated.ok) return null
-    const root = await this.repoRoot(gated.canonical)
+    const root = await this.repoRoot(gated.canonical, signal)
     if (root === null) return null
-    const [branchResult, headResult, porcelain] = await Promise.all([
-      this.runner.run(headBranchArgv(), root),
-      this.runner.run(headShortArgv(), root),
-      this.runner.run(statusPorcelainArgv(), root),
+    const [branchResult, porcelain] = await Promise.all([
+      this.runner.run(headBranchArgv(), root, signal),
+      this.runner.run(statusPorcelainArgv(), root, signal),
     ])
     const branch = branchResult.stdout.trim()
-    const counts = parsePorcelain(porcelain.stdout)
     return {
       root,
       branch: branch === DETACHED ? '' : branch,
+      counts: parsePorcelain(porcelain.stdout),
+      operationInProgress: await this.operationInProgress(root, signal),
+    }
+  }
+
+  /**
+   * The repository snapshot the branch chip renders; null when not a repository.
+   * Concurrent reads for the same requested workspace share one underlying
+   * status task until it settles, preventing timed-out polls from accumulating.
+   */
+  status(path: string, signal?: AbortSignal): Promise<RepoStatus | null> {
+    const existing = this.statusFlights.get(path)
+    if (existing !== undefined) return existing
+    const flight = this.statusFromPath(path, signal)
+    this.statusFlights.set(path, flight)
+    const clear = (): void => {
+      if (this.statusFlights.get(path) === flight) this.statusFlights.delete(path)
+    }
+    void flight.then(clear, clear)
+    return flight
+  }
+
+  private async statusFromPath(path: string, signal?: AbortSignal): Promise<RepoStatus | null> {
+    const gated = await this.gate(path)
+    if (!gated.ok) return null
+    return this.statusFromGatedPath(gated.canonical, signal)
+  }
+
+  private async statusFromGatedPath(path: string, signal?: AbortSignal): Promise<RepoStatus | null> {
+    const snap = await this.snapshotFromGatedPath(path, signal)
+    if (snap === null) return null
+    const headResult = await this.runner.run(headShortArgv(), snap.root, signal)
+    return {
+      root: snap.root,
+      branch: snap.branch,
       head: headResult.stdout.trim(),
-      dirtyFiles: counts.dirtyFiles,
-      untrackedFiles: counts.untrackedFiles,
-      conflicts: counts.conflicts,
-      operationInProgress: await this.operationInProgress(root),
+      dirtyFiles: snap.counts.dirtyFiles,
+      untrackedFiles: snap.counts.untrackedFiles,
+      conflicts: snap.counts.conflicts,
+      operationInProgress: snap.operationInProgress,
+    }
+  }
+
+  private async snapshotFromGatedPath(path: string, signal?: AbortSignal): Promise<{
+    root: string
+    branch: string
+    counts: ReturnType<typeof parsePorcelain>
+    operationInProgress: boolean
+  } | null> {
+    const root = await this.repoRoot(path, signal)
+    if (root === null) return null
+    const [branchResult, porcelain] = await Promise.all([
+      this.runner.run(headBranchArgv(), root, signal),
+      this.runner.run(statusPorcelainArgv(), root, signal),
+    ])
+    const branch = branchResult.stdout.trim()
+    return {
+      root,
+      branch: branch === DETACHED ? '' : branch,
+      counts: parsePorcelain(porcelain.stdout),
+      operationInProgress: await this.operationInProgress(root, signal),
     }
   }
 
   /** Local branch list with the current branch marked (git for-each-ref refs/heads). */
   async branches(path: string): Promise<BranchesView | null> {
-    const gated = await this.gate(path)
-    if (!gated.ok) return null
-    const root = await this.repoRoot(gated.canonical)
-    if (root === null) return null
-    const [refs, branchResult, porcelain] = await Promise.all([
-      this.runner.run(forEachRefArgv(), root),
-      this.runner.run(headBranchArgv(), root),
-      this.runner.run(statusPorcelainArgv(), root),
-    ])
-    const current = branchResult.stdout.trim()
-    const counts = parsePorcelain(porcelain.stdout)
+    const snap = await this.snapshot(path)
+    if (snap === null) return null
+    const refs = await this.runner.run(forEachRefArgv(), snap.root)
     return {
-      root,
-      branch: current === DETACHED ? '' : current,
+      root: snap.root,
+      branch: snap.branch,
       branches: parseBranches(refs.stdout),
-      dirtyFiles: counts.dirtyFiles,
-      untrackedFiles: counts.untrackedFiles,
-      conflicts: counts.conflicts,
-      operationInProgress: await this.operationInProgress(root),
+      dirtyFiles: snap.counts.dirtyFiles,
+      untrackedFiles: snap.counts.untrackedFiles,
+      conflicts: snap.counts.conflicts,
+      operationInProgress: snap.operationInProgress,
     }
   }
 
@@ -200,8 +244,9 @@ export class GitService {
     if (formatted.exitCode !== 0) {
       return { ok: false, error: { code: 'invalid-branch-name', message: formatted.stderr.trim() || 'invalid branch name' } }
     }
-    const refs = await this.runner.run(forEachRefArgv(), root)
-    if (parseBranches(refs.stdout).some(row => row.name === name)) {
+    // Single-ref probe instead of listing (and locale-sorting) every branch.
+    const exists = await this.runner.run(verifyRefArgv(name), root)
+    if (exists.exitCode === 0) {
       return { ok: false, error: { code: 'branch-already-exists', message: `branch "${name}" already exists` } }
     }
     const blocked = await this.guardBlock(root, undefined)
@@ -233,23 +278,38 @@ export class GitService {
   }
 
   /** Repository root of a canonical path, or null when not inside a git repository. */
-  private async repoRoot(path: string): Promise<string | null> {
-    const result = await this.runner.run(topLevelArgv(), path)
+  private async repoRoot(path: string, signal?: AbortSignal): Promise<string | null> {
+    const result = await this.runner.run(topLevelArgv(), path, signal)
     if (result.exitCode !== 0) return null
     const root = result.stdout.trim()
     return root === '' ? null : root
   }
 
   /** Whether any git operation marker is present in the repository. */
-  private async operationInProgress(root: string): Promise<boolean> {
-    for (const marker of OPERATION_MARKERS) {
-      const resolved = await this.runner.run(gitPathArgv(marker), root)
-      const markerPath = resolved.stdout.trim()
-      // --git-path prints a repo-relative path for in-repo markers (and an
-      // absolute one for worktree/linked stores); resolve covers both.
-      if (markerPath !== '' && existsSync(resolve(root, markerPath))) return true
+  private async operationInProgress(root: string, signal?: AbortSignal): Promise<boolean> {
+    // Preferred path: one spawn for all seven markers (Windows: 7 git.exe
+    // cold starts -> 1). --git-path prints a repo-relative path for in-repo
+    // markers (and an absolute one for worktree/linked stores); resolve
+    // covers both.
+    const resolved = await this.runner.run(operationMarkersArgv(), root, signal)
+    if (resolved.exitCode === 0) {
+      const markerPaths = resolved.stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line !== '')
+      return markerPaths.some((markerPath) => existsSync(resolve(root, markerPath)))
     }
-    return false
+    // Non-zero combined exit: fall back to the per-marker sequential probe
+    // (same as the pre-merge implementation) so a single failed rev-parse
+    // cannot silently hide an in-progress operation. Every marker is probed
+    // and the verdict is true when any path exists; all-missing returns false.
+    let inProgress = false
+    for (const marker of OPERATION_MARKERS) {
+      const single = await this.runner.run(gitPathArgv(marker), root, signal)
+      const markerPath = single.stdout.trim()
+      if (markerPath !== '' && existsSync(resolve(root, markerPath))) inProgress = true
+    }
+    return inProgress
   }
 
   /**

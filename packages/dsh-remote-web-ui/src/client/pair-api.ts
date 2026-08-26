@@ -36,6 +36,22 @@ export interface IssueLoopbackRequired {
 
 export type IssueResponse = IssueResult | IssueLanRequired | IssueUnknownAddress | IssueLoopbackRequired
 
+/** Public policy fields returned by the pairing status endpoint. */
+export interface PairGatePolicy {
+  requirePairingForLan: boolean
+}
+
+/** Read the host-authoritative desktop pairing policy. */
+export async function readPairGatePolicy(): Promise<PairGatePolicy> {
+  const response = await fetch('/api/pair/status')
+  if (!response.ok) throw new Error(`remote-web-ui: status failed with ${String(response.status)}`)
+  const value = await response.json() as { requirePairingForLan?: unknown }
+  if (typeof value.requirePairingForLan !== 'boolean') {
+    throw new Error('remote-web-ui: status omitted requirePairingForLan')
+  }
+  return { requirePairingForLan: value.requirePairingForLan }
+}
+
 /** accept() refusal codes. */
 export type AcceptFailure = { ok: false; code: 'invalid' | 'used' | 'forbidden' }
 
@@ -44,6 +60,12 @@ export interface TunnelStatusFrame {
   state: 'starting' | 'running' | 'failed'
   url?: string
   error?: string
+}
+
+/** One /api posture frame (host half probe; see src/posture.ts). */
+export interface PostureFrame {
+  checkedAt: number
+  hosts: { host: string; exposed: boolean }[]
 }
 
 /** One /api/pair/events frame. */
@@ -55,8 +77,21 @@ export interface PairStateFrame {
   tokenExpiresAt?: number
   deviceCount: number
   onlineCount: number
+  /** Per-device roster (loopback events only). */
+  devices?: DeviceFrame[]
   /** Auto-tunnel status, while the auto-tunnel feature is active. */
   tunnel?: TunnelStatusFrame
+  /** Latest /api fence posture probe, once a round has completed. */
+  posture?: PostureFrame
+}
+
+/** One authorized-device row from the loopback status stream. */
+export interface DeviceFrame {
+  id: string
+  createdAt: number
+  lastSeenAt: number
+  online: boolean
+  userAgent?: string
 }
 
 /**
@@ -112,6 +147,20 @@ export async function stopPair(): Promise<void> {
   if (!response.ok) throw new Error(`remote-web-ui: stop failed with ${String(response.status)}`)
 }
 
+/**
+ * Revoke one paired device from the loopback panel.
+ * @param deviceId - the session id of the row to drop.
+ */
+export async function revokePair(deviceId: string): Promise<void> {
+  const response = await fetch('/api/pair/revoke', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ deviceId }),
+  })
+  if (response.status === 404) return
+  if (!response.ok) throw new Error(`remote-web-ui: revoke failed with ${String(response.status)}`)
+}
+
 /** Presence heartbeat from a paired phone (unpaired heartbeats 401 harmlessly). */
 export async function sendHeartbeat(): Promise<void> {
   await fetch('/api/pair/heartbeat', { method: 'POST' })
@@ -137,12 +186,30 @@ export function stripParam(name: string): string {
   const url = new URL(window.location.href)
   url.searchParams.delete(name)
   return url.search
-}/** Human-readable expiry clock, e.g. "10:35". */
+}
+
+/** Convert an issued `/m/` link into the desktop pairing form. */
+export function desktopPairUrl(mobileUrl: string): string {
+  const url = new URL(mobileUrl)
+  url.pathname = '/'
+  return url.href
+}
+
+/** Human-readable expiry clock, e.g. "10:35". */
 export function formatClock(epochMs: number): string {
   const date = new Date(epochMs)
   const hours = String(date.getHours()).padStart(2, '0')
   const minutes = String(date.getMinutes()).padStart(2, '0')
   return `${hours}:${minutes}`
+}
+
+/** Calendar + clock for last-seen timestamps, e.g. "2026-08-19 10:35". */
+export function formatLastSeen(epochMs: number): string {
+  const date = new Date(epochMs)
+  const year = String(date.getFullYear())
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day} ${formatClock(epochMs)}`
 }
 
 /**

@@ -3,7 +3,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { SessionModels } from '@deepseek-ai/dsh-host-apiproxy/api/sessions'
-import { ChatView, MAX_TAIL_BUFFER_EVENTS } from './ChatView.tsx'
+import { ChatView, MAX_TAIL_BUFFER_EVENTS, LONG_TEXT_LIMIT } from './ChatView.tsx'
 import { type SessionView } from './App.tsx'
 import type { HistoryPage } from '../api.ts'
 import type { WireEvent } from '../messages.ts'
@@ -15,6 +15,8 @@ vi.mock('../api.ts', () => ({
   models: vi.fn(),
   selectModel: vi.fn(),
   sendCommand: vi.fn(),
+  cancelSession: vi.fn(),
+  fetchPending: vi.fn(),
 }))
 vi.mock('./App.tsx', async importOriginal => {
   const actual = await importOriginal<typeof import('./App.tsx')>()
@@ -24,8 +26,7 @@ vi.mock('./App.tsx', async importOriginal => {
     prompt: vi.fn(async () => {}),
   }
 })
-import { fetchMobilePreferences, models, selectModel, sendCommand } from '../api.ts'
-import { setDisplayOptions } from '../display-options.ts'
+import { fetchMobilePreferences, models, selectModel, sendCommand, cancelSession, fetchPending } from '../api.ts'
 import { loadHistory, prompt } from './App.tsx'
 
 const session: SessionView = {
@@ -44,6 +45,18 @@ function makeEntry(type: string, data: unknown, seq: number): { event: WireEvent
 /** Build a history page from loose wire events (the host union is strict). */
 function historyPage(events: Array<{ event: WireEvent }>, extra: Record<string, unknown> = {}): HistoryPage {
   return { events: events as never, hasMore: false, ...extra } as HistoryPage
+}
+
+/** Minimal mux stand-in: captures the ChatView's frame listener for hand-off. */
+class FakeMux {
+  listeners = new Set<(frame: unknown) => void>()
+  onFrame(listener: (frame: unknown) => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+  emit(frame: unknown): void {
+    for (const listener of this.listeners) listener(frame)
+  }
 }
 
 /** A full turn: user message, reasoning + text chunks, tool calls, final message. */
@@ -73,15 +86,14 @@ const fetchMobilePreferencesMock = vi.mocked(fetchMobilePreferences)
 const modelsMock = vi.mocked(models)
 const selectModelMock = vi.mocked(selectModel)
 const sendCommandMock = vi.mocked(sendCommand)
+const cancelSessionMock = vi.mocked(cancelSession)
+const fetchPendingMock = vi.mocked(fetchPending)
 const loadHistoryMock = vi.mocked(loadHistory)
 const promptMock = vi.mocked(prompt)
 
 beforeEach(() => {
   fetchMobilePreferencesMock.mockResolvedValue({ mobileEnterToSend: true })
   promptMock.mockResolvedValue(undefined)
-  // The display-option store is module-level: restore both defaults so a
-  // toggle in one test cannot leak into the next describe.
-  setDisplayOptions({ showTools: true, showSystemMessages: false })
   modelsMock.mockResolvedValue({
     current: { provider: 'fx', model: 'fx-1' },
     routable: true,
@@ -99,6 +111,8 @@ beforeEach(() => {
   } satisfies SessionModels)
   selectModelMock.mockResolvedValue({ selected: { provider: 'fx', model: 'fx-2', reasoningEffort: 'high' } })
   sendCommandMock.mockResolvedValue({})
+  cancelSessionMock.mockResolvedValue({ accepted: true })
+  fetchPendingMock.mockResolvedValue({ approvals: [], questions: [] })
 })
 
 afterEach(() => {
@@ -138,20 +152,6 @@ describe('ChatView message folds', () => {
     expect(head.getAttribute('aria-expanded')).toBe('true')
     expect(await screen.findByText('{"cmd":"ls"}')).toBeTruthy()
     expect(screen.getByText('bash')).toBeTruthy()
-  })
-
-  it('renders assistant text as Markdown (headings, emphasis)', async () => {
-    loadHistoryMock.mockResolvedValue(historyPage([
-      makeEntry('assistant/message', {
-        turn: 0,
-        step: 0,
-        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: '## 结论\n\n**加粗**' }] },
-      }, 0),
-    ]))
-    render(<ChatView session={session} onBack={() => {}} />)
-
-    expect(await screen.findByRole('heading', { level: 2, name: '结论' })).toBeTruthy()
-    expect(screen.getByText('加粗').tagName).toBe('STRONG')
   })
 
   it('shows the permission chip from the history-tail projection and applies via /permission', async () => {
@@ -208,102 +208,6 @@ describe('ChatView message folds', () => {
     await waitFor(() => {
       expect(sendCommandMock).toHaveBeenCalledWith('s-1', '/permission danger-full-access')
     })
-  })
-  it('shows context occupancy from the latest usage against the advertised window', async () => {
-    loadHistoryMock.mockResolvedValue(historyPage([
-      makeEntry('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
-      ...turnEvents().map((entry, index) => makeEntry(entry.event.type, entry.event.data, index + 1)),
-      makeEntry('assistant/message', {
-        turn: 1,
-        step: 0,
-        message: { id: 'a-2', role: 'assistant', content: [{ type: 'text', text: '收尾' }] },
-        usage: { inputTokens: 5_000, outputTokens: 100, cacheReadTokens: 45_000 },
-      }, 7),
-    ]))
-    render(<ChatView session={session} onBack={() => {}} />)
-
-    // (5000 + 45000) / 100000 = 50%.
-    expect(await screen.findByText('上下文 50%')).toBeTruthy()
-  })
-})
-
-describe('ChatView initial-load race', () => {
-  /** Minimal mux stand-in: captures the ChatView's frame listener for hand-off. */
-  class FakeMux {
-    listeners = new Set<(frame: unknown) => void>()
-    onFrame(listener: (frame: unknown) => void): () => void {
-      this.listeners.add(listener)
-      return () => { this.listeners.delete(listener) }
-    }
-    emit(frame: unknown): void {
-      for (const listener of this.listeners) listener(frame)
-    }
-  }
-
-  it('keeps live events that arrive while the tail page is still loading', async () => {
-    let resolveHistory: (page: HistoryPage) => void = () => {}
-    loadHistoryMock.mockReturnValue(new Promise<HistoryPage>((resolve) => { resolveHistory = resolve }))
-    const mux = new FakeMux()
-    render(<ChatView session={session} mux={mux as never} onBack={() => {}} />)
-
-    // A live turn starts before the snapshot resolves: chunk, tool call, final.
-    await act(async () => {
-      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('assistant/chunk', { turn: 1, step: 0, chunk: { type: 'text-delta', text: '正在' } }, 6).event })
-      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('tool/call', { turn: 1, step: 0, callId: 'c9', name: 'bash', arguments: '{"cmd":"ls"}' }, 7).event })
-      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry('assistant/message', { turn: 1, step: 0, message: { id: 'a-9', role: 'assistant', content: [{ type: 'text', text: '实时新消息' }] } }, 8).event })
-    })
-    // The snapshot predates those events; resolving it must not drop them.
-    await act(async () => { resolveHistory(historyPage(turnEvents())) })
-
-    expect(await screen.findByText('实时新消息')).toBeTruthy()
-    // The history turn's tool disclosure plus the live one both render.
-    expect((await screen.findAllByRole('button', { name: /工具/ })).length).toBe(2)
-  })
-})
-
-describe('ChatView display options', () => {
-  beforeEach(() => {
-    // The store is module-level; reset both toggles so tests stay independent.
-    setDisplayOptions({ showTools: true, showSystemMessages: false })
-  })
-
-  it('hides host-injected messages by default and reveals them from the display sheet', async () => {
-    loadHistoryMock.mockResolvedValue(historyPage([
-      makeEntry('user/message', {
-        id: 'sys-1',
-        role: 'user',
-        source: { kind: 'agent-instructions' },
-        content: [{ type: 'text', text: '注入的工作区指令' }],
-      }, 0),
-      ...turnEvents().map((entry, index) => makeEntry(entry.event.type, entry.event.data, index + 1)),
-    ]))
-    render(<ChatView session={session} onBack={() => {}} />)
-
-    expect(await screen.findByText('改一下代码')).toBeTruthy()
-    expect(screen.queryByText('注入的工作区指令')).toBeNull()
-
-    fireEvent.click(await screen.findByRole('button', { name: /显示/ }))
-    const toggle = await screen.findByRole('button', { name: /系统提示词/ })
-    expect(toggle.getAttribute('aria-pressed')).toBe('false')
-    fireEvent.click(toggle)
-    expect(toggle.getAttribute('aria-pressed')).toBe('true')
-    expect(await screen.findByText('注入的工作区指令')).toBeTruthy()
-  })
-
-  it('hides tool disclosures when the tools option is switched off', async () => {
-    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
-    render(<ChatView session={session} onBack={() => {}} />)
-    expect(await screen.findByRole('button', { name: /工具/ })).toBeTruthy()
-
-    fireEvent.click(await screen.findByRole('button', { name: /显示/ }))
-    fireEvent.click(await screen.findByRole('button', { name: /工具调用/ }))
-    // Close the sheet (backdrop click) so its rows do not match the query.
-    const backdrop = document.querySelector('.sheet-backdrop')
-    expect(backdrop).not.toBeNull()
-    fireEvent.click(backdrop as Element)
-    await waitFor(() => { expect(screen.queryByRole('button', { name: /工具/ })).toBeNull() })
-    // The final assistant text still renders without the tool card.
-    expect(screen.getByText('已完成修改')).toBeTruthy()
   })
 })
 
@@ -632,3 +536,281 @@ describe('ChatView scrolling', () => {
     await waitFor(() => { expect(scrollWrites.length).toBe(writesBefore) })
   })
 })
+
+describe('ChatView display toggles and context usage', () => {
+  /** jsdom in this setup ships a bare localStorage object; install a real fake. */
+  const makeStorage = (): Storage => {
+    const map = new Map<string, string>()
+    return {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => { map.set(key, value) },
+      removeItem: (key: string) => { map.delete(key) },
+      clear: () => { map.clear() },
+      key: (index: number) => [...map.keys()][index] ?? null,
+      get length() { return map.size },
+    } as Storage
+  }
+
+  /** A user/message whose source.kind is 'plugin' (injected system message). */
+  const systemEvents = (): Array<{ event: WireEvent }> => [
+    makeEntry('user/message', {
+      id: 'u-plugin',
+      role: 'user',
+      content: [{ type: 'text', text: '系统注入消息' }],
+      source: { kind: 'plugin', name: 'react-extension' },
+    }, 0),
+    makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '普通消息' }] }, 1),
+  ]
+
+  const toolEvents = (): Array<{ event: WireEvent }> => [
+    makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '改文件' }] }, 0),
+    makeEntry('assistant/message', {
+      turn: 0,
+      step: 0,
+      message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: '完成' }] },
+    }, 1),
+    makeEntry('tool/call', { turn: 0, step: 0, callId: 'c1', name: 'bash', arguments: '{}' }, 2),
+  ]
+
+  beforeEach(() => {
+    vi.stubGlobal('localStorage', makeStorage())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('hides injected user messages by default and reveals them via the display sheet', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(systemEvents()))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    // The plugin-injected message is hidden by default; the real user message shows.
+    expect(await screen.findByText('普通消息')).toBeTruthy()
+    expect(screen.queryByText('系统注入消息')).toBeNull()
+
+    // Open the display sheet and flip the system-message switch on.
+    fireEvent.click(screen.getByRole('button', { name: /显示/ }))
+    const systemSwitch = await screen.findByRole('switch', { name: '系统提示词' })
+    expect(systemSwitch.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(systemSwitch)
+    expect(await screen.findByText('系统注入消息')).toBeTruthy()
+
+    // Flip it back off: the injected row disappears again.
+    const systemSwitchAfter = screen.getByRole('switch', { name: '系统提示词' })
+    expect(systemSwitchAfter.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(systemSwitchAfter)
+    expect(screen.queryByText('系统注入消息')).toBeNull()
+  })
+
+  it('hides the tool disclosure when the tool-call toggle is off', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(toolEvents()))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    // Tool disclosure visible by default.
+    expect(await screen.findByRole('button', { name: /工具/ })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /显示/ }))
+    const toolSwitch = await screen.findByRole('switch', { name: '工具调用' })
+    expect(toolSwitch.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(toolSwitch)
+
+    // The disclosure is gone while reasoning/text remain.
+    expect(screen.queryByRole('button', { name: /工具/ })).toBeNull()
+    expect(screen.getByText('完成')).toBeTruthy()
+  })
+
+  it('renders the context usage chip from request/context plus assistant usage', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
+      makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'hi' }] }, 1),
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        usage: { inputTokens: 30_000, outputTokens: 1_000 },
+      }, 2),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+    expect(await screen.findByText('上下文 30%')).toBeTruthy()
+  })
+
+  it('adds the warn class when context usage is at or above 80%', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
+      makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'hi' }] }, 1),
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        usage: { inputTokens: 80_000, outputTokens: 0 },
+      }, 2),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+    const chip = await screen.findByText('上下文 80%')
+    expect(chip.className).toContain('chat-context-warn')
+  })
+
+  it('renders no context chip when there is no usage/context data', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
+    render(<ChatView session={session} onBack={() => {}} />)
+    await screen.findByText('已完成修改')
+    expect(screen.queryByText(/上下文/)).toBeNull()
+  })
+})
+
+describe('ChatView stop button (#1041)', () => {
+  /** Emit one session lifecycle frame for the chat's session. */
+  function emitSessionEvent(mux: FakeMux, type: string, seq: number): void {
+    act(() => {
+      mux.emit({ type: 'session/event', sessionId: 's-1', event: makeEntry(type, {}, seq).event })
+    })
+  }
+
+  it('switches the composer primary to a stop button while running and cancels the turn', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([]))
+    const mux = new FakeMux()
+    render(<ChatView session={session} mux={mux as never} onBack={() => {}} />)
+
+    // Idle: the primary button is the (empty-draft disabled) send button.
+    const sendButton = await screen.findByRole('button', { name: '发送' })
+    expect((sendButton as HTMLButtonElement).disabled).toBe(true)
+
+    // Turn starts: the primary becomes an enabled stop button (square icon).
+    emitSessionEvent(mux, 'turn/start', 1)
+    const stopButton = (await screen.findByRole('button', { name: '停止' })) as HTMLButtonElement
+    expect(stopButton.disabled).toBe(false)
+
+    fireEvent.click(stopButton)
+    await waitFor(() => expect(cancelSessionMock).toHaveBeenCalledWith('s-1'))
+
+    // Turn ends: the primary flips back to send.
+    emitSessionEvent(mux, 'turn/end', 2)
+    expect(await screen.findByRole('button', { name: '发送' })).toBeTruthy()
+  })
+
+  it('disables the stop button while the cancel request is in flight', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([]))
+    let resolveCancel: (() => void) | undefined
+    cancelSessionMock.mockReturnValue(new Promise<{ accepted: true }>((resolve) => {
+      resolveCancel = () => { resolve({ accepted: true }) }
+    }))
+    const mux = new FakeMux()
+    render(<ChatView session={session} mux={mux as never} onBack={() => {}} />)
+    await screen.findByRole('button', { name: '发送' })
+
+    emitSessionEvent(mux, 'turn/start', 1)
+    const stopButton = (await screen.findByRole('button', { name: '停止' })) as HTMLButtonElement
+    fireEvent.click(stopButton)
+
+    // In flight: disabled and re-labeled; a second tap cannot double-submit.
+    const inflight = (await screen.findByRole('button', { name: '停止中' })) as HTMLButtonElement
+    expect(inflight.disabled).toBe(true)
+    fireEvent.click(inflight)
+    expect(cancelSessionMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => { resolveCancel?.() })
+    emitSessionEvent(mux, 'turn/end', 2)
+    expect(await screen.findByRole('button', { name: '发送' })).toBeTruthy()
+  })
+
+  it('surfaces a cancel failure through the chat error line', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([]))
+    cancelSessionMock.mockRejectedValue(new Error('cancel exploded'))
+    const mux = new FakeMux()
+    render(<ChatView session={session} mux={mux as never} onBack={() => {}} />)
+    await screen.findByRole('button', { name: '发送' })
+
+    emitSessionEvent(mux, 'turn/start', 1)
+    fireEvent.click(await screen.findByRole('button', { name: '停止' }))
+    expect(await screen.findByText(/cancel exploded/)).toBeTruthy()
+  })
+})
+
+describe('ChatView message visibility and long text folding (#1065)', () => {
+  const toolOnlyEvents = (): Array<{ event: WireEvent }> => [
+    makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '查询文件' }] }, 0),
+    makeEntry('assistant/message', {
+      turn: 0,
+      step: 0,
+      message: { id: 'a-1', role: 'assistant', content: [] },
+    }, 1),
+    makeEntry('tool/call', { turn: 0, step: 0, callId: 'c1', name: 'read_file', arguments: '{"path":"/a"}' }, 2),
+  ]
+
+  it('hides assistant message completely (no air bubble) when only tool calls exist and tool toggle is off', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(toolOnlyEvents()))
+    const { container } = render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByText('查询文件')).toBeTruthy()
+    // By default showToolCalls is true, tool disclosure is visible
+    expect(await screen.findByRole('button', { name: /工具/ })).toBeTruthy()
+
+    // Turn off tool-calls toggle
+    fireEvent.click(screen.getByRole('button', { name: /显示/ }))
+    const toolSwitch = await screen.findByRole('switch', { name: '工具调用' })
+    fireEvent.click(toolSwitch)
+
+    // The tool disclosure is gone, and the entire assistant message bubble is not rendered (no air bubble)
+    expect(screen.queryByRole('button', { name: /工具/ })).toBeNull()
+    const msgElements = container.querySelectorAll('.chat-msg')
+    expect(msgElements.length).toBe(1)
+    expect(msgElements[0]?.classList.contains('chat-msg-user')).toBe(true)
+  })
+
+  it('renders failed tag even if assistant message has no text or reasoning', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '测试失败' }] }, 0),
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [] },
+      }, 1),
+      makeEntry('turn/end', { turn: 0, reason: { kind: 'error', message: 'timeout' } }, 2),
+    ]))
+    render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByText('测试失败')).toBeTruthy()
+    expect(await screen.findByText('本次回复失败')).toBeTruthy()
+  })
+
+  it('collapses terminal assistant text exceeding LONG_TEXT_LIMIT and toggles open/close', async () => {
+    const longText = 'A'.repeat(LONG_TEXT_LIMIT + 100)
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '生成长文本' }] }, 0),
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: longText }] },
+      }, 1),
+    ]))
+    const { container } = render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByText('生成长文本')).toBeTruthy()
+    const toggleButton = await screen.findByRole('button', { name: new RegExp(`展开全文（${LONG_TEXT_LIMIT + 100} 字）`) })
+    expect(toggleButton).toBeTruthy()
+    expect(container.querySelector('.chat-md-collapsed')).not.toBeNull()
+
+    // Expand
+    fireEvent.click(toggleButton)
+    expect(await screen.findByRole('button', { name: '收起' })).toBeTruthy()
+    expect(container.querySelector('.chat-md-collapsed')).toBeNull()
+  })
+
+  it('does not collapse terminal assistant text within LONG_TEXT_LIMIT', async () => {
+    const shortText = 'B'.repeat(LONG_TEXT_LIMIT)
+    loadHistoryMock.mockResolvedValue(historyPage([
+      makeEntry('user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: '生成中等文本' }] }, 0),
+      makeEntry('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: shortText }] },
+      }, 1),
+    ]))
+    const { container } = render(<ChatView session={session} onBack={() => {}} />)
+
+    expect(await screen.findByText('生成中等文本')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /展开全文/ })).toBeNull()
+    expect(container.querySelector('.chat-md-collapsed')).toBeNull()
+  })
+})
+

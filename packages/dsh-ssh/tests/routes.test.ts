@@ -6,7 +6,7 @@
 
 import { createServer, request as httpRequest, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocket } from 'ws'
@@ -23,6 +23,7 @@ class StubEngine {
   uploadError: Error | undefined
   openShellSession: ShellSession | undefined
   shellInputs: string[] = []
+  dropAliasCalls: string[] = []
 
   list(): SshHostSummary[] {
     return this.hosts
@@ -40,8 +41,12 @@ class StubEngine {
     if (this.uploadError !== undefined) throw this.uploadError
     return { bytes: this.uploadBytes, files: 1 }
   }
+  /** Mode of the staged destination file, recorded when download writes it. */
+  downloadMode: number | undefined
+
   async download(_alias: string, _remotePath: string, localPath: string): Promise<{ bytes: number }> {
     // Materialize the staged file the download route streams out.
+    this.downloadMode = statSync(localPath).mode & 0o777
     writeFileSync(localPath, 'hello', 'utf8')
     return { bytes: 5 }
   }
@@ -59,6 +64,9 @@ class StubEngine {
   }
   stopAllTunnels(): number {
     return 0
+  }
+  dropAlias(alias: string): void {
+    this.dropAliasCalls.push(alias)
   }
   async openShell(_alias: string): Promise<ShellSession> {
     const session: ShellSession = {
@@ -99,7 +107,7 @@ function get(path: string, headers: Record<string, string> = {}): Promise<{ stat
 beforeAll(async () => {
   store = new HostStore(join(dir, 'hosts.json'))
   stub = new StubEngine()
-  const { routes, upgrade } = makeRoutes({ store, engine: engine(stub), stagingDir: join(dir, 'staging') })
+  const { routes, upgrade } = makeRoutes({ store, engine: engine(stub), stagingDir: join(dir, 'staging'), maxUploadBytes: 64 })
   server = createServer((req, res) => {
     const rawPath = new URL(req.url ?? '/', 'http://x').pathname
     const route = routes.find(r => r.kind === 'exact' && r.path === rawPath)
@@ -184,14 +192,26 @@ describe('hosts CRUD (one handler per path)', () => {
     expect(patch.status).toBe(200)
     expect(store.find('web-01')?.description).toBe('renewed')
     expect(store.find('web-01')?.auth.password).toBe('pw')
+    // Metadata-only patches keep the pooled connection alive.
+    expect(stub.dropAliasCalls).toHaveLength(0)
+
+    // Credential changes invalidate the pooled connection immediately.
+    const authPatch = await fetch('http://127.0.0.1:' + port + SSH_API.hosts + '?alias=web-01', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ auth: { kind: 'password', password: 'pw2' } }),
+    })
+    expect(authPatch.status).toBe(200)
+    expect(stub.dropAliasCalls).toEqual(['web-01'])
 
     const del = await fetch('http://127.0.0.1:' + port + SSH_API.hosts + '?alias=web-01', { method: 'DELETE' })
     expect(del.status).toBe(200)
     expect(store.list()).toHaveLength(0)
+    expect(stub.dropAliasCalls).toEqual(['web-01', 'web-01'])
   })
 
   it('rejects unknown methods on the hosts path with 405', async () => {
-    const result = await get(SSH_API.hosts, {})
+    await get(SSH_API.hosts, {})
     // GET via httpRequest has no body; use OPTIONS to hit the fallback.
     const options = await new Promise<{ status: number }>((resolve, reject) => {
       const req = httpRequest({ host: '127.0.0.1', port, path: SSH_API.hosts, method: 'OPTIONS' }, (res) => {
@@ -220,6 +240,27 @@ describe('upload', () => {
     expect(result?.ok).toBe(true)
   })
 
+  it('enforces the byte cap for chunked uploads with no content-length', async () => {
+    const result = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port, path: SSH_API.upload + '?alias=web-01&remotePath=/tmp/big.bin', method: 'POST' }, (res) => {
+        let text = ''
+        res.on('data', (chunk: Buffer) => { text += chunk.toString('utf8') })
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, text }))
+      })
+      req.on('error', reject)
+      // Chunked transfer: no content-length pre-check can save us.
+      req.write('x'.repeat(48))
+      req.write('y'.repeat(48))
+      req.end()
+    })
+    expect(result.status).toBe(200)
+    const frames = result.text.split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
+    const frame = frames.find(line => line.type === 'result')
+    expect(frame?.ok).toBe(false)
+    expect(String(frame?.error)).toContain('too large')
+    expect(readdirSync(join(dir, 'staging'))).toHaveLength(0)
+  })
+
   it('reports engine failures through the result frame', async () => {
     stub.uploadError = new Error('remote rejected')
     const res = await fetch('http://127.0.0.1:' + port + SSH_API.upload + '?alias=web-01&remotePath=/tmp/x.txt', {
@@ -232,6 +273,11 @@ describe('upload', () => {
     expect(result?.ok).toBe(false)
     expect(String(result?.error)).toContain('remote rejected')
   })
+
+  it('keeps the staging directory private (0700)', () => {
+    const mode = statSync(join(dir, 'staging')).mode & 0o777
+    if (process.platform !== 'win32') expect(mode).toBe(0o700)
+  })
 })
 
 describe('download', () => {
@@ -240,6 +286,11 @@ describe('download', () => {
     expect(res.status).toBe(200)
     expect(res.headers.get('content-disposition')).toContain('app.tar.gz')
     expect(res.headers.get('content-length')).toBe('5')
+  })
+
+  it('stages the download in a 0600 file', async () => {
+    await fetch('http://127.0.0.1:' + port + SSH_API.download + '?alias=web-01&remotePath=/tmp/private.tar.gz')
+    if (process.platform !== 'win32') expect(stub.downloadMode).toBe(0o600)
   })
 })
 

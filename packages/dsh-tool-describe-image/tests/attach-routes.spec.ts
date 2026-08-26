@@ -6,11 +6,11 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentLimits, ImageAttachmentRef, SaveImageAttachment, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { Context } from '@deepseek-ai/cordis'
-import { attachmentMarkdown, attachmentNote, attachmentRefById, handleAttach, registerAttachRoute, registerAttachmentRef, validateAttachPayload, type AttachError } from '../src/attach-routes.ts'
+import { attachBodyCap, attachmentMarkdown, attachmentNote, attachmentRefById, handleAttach, registerAttachRoute, registerAttachmentRef, validateAttachPayload, type AttachError } from '../src/attach-routes.ts'
 import type { AttachPayload } from '../src/attach-routes.ts'
 import { PNG_BYTES } from './mock-server.ts'
 
@@ -25,6 +25,7 @@ class FakeAttachments extends AttachmentStore {
       maxImagesPerMessage: 5,
       maxMessageImageBytes: 20_000_000,
       maxImagePixels: 10_000_000,
+      maxImageDimension: 2_000,
       mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
     }
   }
@@ -48,11 +49,13 @@ class FakeAttachments extends AttachmentStore {
 
   /** Bytes by attachment id, for the raw-image GET tests. */
   readonly stored = new Map<string, Buffer>()
+  /** Optional canonical metadata returned after the store validates a reference. */
+  readRef?: ImageAttachmentRef
 
   readImage(ref: ImageAttachmentRef, _signal?: AbortSignal): Promise<StoredImageAttachment> {
     const data = this.stored.get(String(ref.attachmentId))
     if (data === undefined) return Promise.reject(new Error('no such attachment'))
-    return Promise.resolve({ data, mediaType: ref.mediaType, ref })
+    return Promise.resolve({ data, mediaType: ref.mediaType, ref: this.readRef ?? ref })
   }
 }
 
@@ -69,6 +72,16 @@ function errOf(result: { payload: AttachPayload; bytes: Buffer } | { error: Atta
 }
 
 const PNG_BASE64 = PNG_BYTES.toString('base64')
+
+describe('attachBodyCap', () => {
+  it('stays under the legacy 16 MiB wall for the default 10 MiB bound', () => {
+    expect(attachBodyCap(10 * 1024 * 1024)).toBeLessThan(16 * 1024 * 1024)
+  })
+
+  it('scales above the legacy wall when the image bound is raised', () => {
+    expect(attachBodyCap(20 * 1024 * 1024)).toBeGreaterThan(16 * 1024 * 1024)
+  })
+})
 
 describe('validateAttachPayload', () => {
   it('accepts a well-formed PNG payload', () => {
@@ -147,6 +160,29 @@ describe('attachmentNote', () => {
   })
 })
 
+describe('attachmentMarkdown', () => {
+  it('embeds the complete durable reference when metadata is available', () => {
+    const ref: ImageAttachmentRef = {
+      attachmentId: `sha256:${'d'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: 'image/png',
+      bytes: PNG_BYTES.length,
+      width: 1,
+      height: 1,
+      name: 'screen (1).png',
+    }
+    const markdown = attachmentMarkdown(ref)
+    const match = /\(([^)]+)\)$/.exec(markdown)
+    expect(match).not.toBeNull()
+    const url = new URL(match?.[1] ?? '', 'http://dsh.local')
+    expect(url.pathname).toBe(`/describe-image/raw/${ref.attachmentId}`)
+    expect(url.searchParams.get('ref')).toBe(JSON.stringify(ref))
+  })
+
+  it('keeps legacy id-only Markdown available for callers without metadata', () => {
+    expect(attachmentMarkdown('sha256:legacy')).toBe('![图片](/describe-image/raw/sha256:legacy)')
+  })
+})
+
 describe('attachment reference registry', () => {
   it('remembers references persisted by the route and resolves them by bare id', async () => {
     const { ctx, store } = await makeCtx(true)
@@ -186,7 +222,10 @@ describe('handleAttach', () => {
     expect(outcome.ok).toBe(true)
     if (outcome.ok) {
       expect(outcome.note.startsWith('[image attachment {')).toBe(true)
-      expect(outcome.markdown).toMatch(/^!\[图片\]\(\/describe-image\/raw\/sha256:/)
+      expect(outcome.markdown).toMatch(/^!\[图片\]\(\/describe-image\/raw\/sha256:.*\?ref=/)
+      const path = /\(([^)]+)\)$/.exec(outcome.markdown)?.[1]
+      const url = new URL(path ?? '', 'http://dsh.local')
+      expect(url.searchParams.get('ref')).toBe(JSON.stringify(outcome.ref))
       expect(outcome.ref.mediaType).toBe('image/png')
       expect(store?.saved).toHaveLength(1)
       expect(store?.saved[0].input.data).toEqual(PNG_BYTES)
@@ -225,29 +264,38 @@ describe('handleAttach', () => {
 
 describe('registerAttachRoute', () => {
   /** One async-iterable fake request carrying an optional body. */
-  const makeReq = (method: string, body?: string, url = '/describe-image/attach'): IncomingMessage => ({
+  const makeReq = (method: string, body?: string, url = '/describe-image/attach', overrides?: {
+    remoteAddress?: string
+    headers?: Record<string, string>
+  }): IncomingMessage => ({
     method,
     url,
+    socket: { remoteAddress: overrides?.remoteAddress ?? '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081', ...(overrides?.headers ?? {}) },
     [Symbol.asyncIterator]: async function* () {
       if (body !== undefined) yield Buffer.from(body)
     },
   } as unknown as IncomingMessage)
 
   /** One fake response collecting status/headers/body. */
-  const makeRes = (): { res: ServerResponse; status: () => number; body: () => string } => {
+  const makeRes = (): { res: ServerResponse; status: () => number; body: () => string; headers: () => Record<string, string | number> | undefined } => {
     let status = 0
     let body = ''
+    let headers: Record<string, string | number> | undefined
     const res = {
-      writeHead: (code: number) => { status = code },
+      writeHead: (code: number, nextHeaders?: Record<string, string | number>) => {
+        status = code
+        headers = nextHeaders
+      },
       end: (chunk?: unknown) => {
         if (chunk !== undefined && chunk !== null) body += String(chunk)
       },
     } as unknown as ServerResponse
-    return { res, status: () => status, body: () => body }
+    return { res, status: () => status, body: () => body, headers: () => headers }
   }
 
   /** Register the route and return the captured prefix row. */
-  const capture = (attachments: AttachmentStore | undefined, webserver: boolean) => {
+  const capture = (attachments: AttachmentStore | undefined, webserver: boolean, readMaxBytes?: () => number) => {
     const registrations: Array<{ kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }> = []
     const webServer = webserver
       ? { register: (row: { kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }) => { registrations.push(row); return () => {} } }
@@ -259,7 +307,7 @@ describe('registerAttachRoute', () => {
         return undefined
       },
     }
-    registerAttachRoute(ctx as unknown as Context)
+    registerAttachRoute(ctx as unknown as Context, readMaxBytes)
     return registrations
   }
 
@@ -272,6 +320,60 @@ describe('registerAttachRoute', () => {
 
   it('is a no-op when no webserver is mounted', () => {
     expect(capture(undefined, false)).toHaveLength(0)
+  })
+
+  describe('loopback fence', () => {
+    it('answers 403 for a LAN socket on POST attach without touching the store', async () => {
+      const { store } = await makeCtx(true)
+      const registrations = capture(store, true)
+      const { res, status, body } = makeRes()
+      await registrations[0].handler(makeReq('POST', '{}', '/describe-image/attach', { remoteAddress: '192.168.1.5' }), res)
+      expect(status()).toBe(403)
+      expect(body()).toContain('forbidden: loopback-only')
+      expect(store?.saved).toHaveLength(0)
+    })
+
+    it('answers 403 for a LAN socket on the raw-image GET', async () => {
+      const { store } = await makeCtx(true)
+      const ref: ImageAttachmentRef = {
+        attachmentId: `sha256:${'a'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+        mediaType: 'image/png',
+        bytes: PNG_BYTES.length,
+        width: 1,
+        height: 1,
+      }
+      store?.stored.set(String(ref.attachmentId), PNG_BYTES)
+      const registrations = capture(store, true)
+      const { res, status, body } = makeRes()
+      const markdown = attachmentMarkdown(ref)
+      const path = /\(([^)]+)\)$/.exec(markdown)?.[1]
+      await registrations[0].handler(makeReq('GET', undefined, path, { remoteAddress: '10.0.0.7' }), res)
+      expect(status()).toBe(403)
+      expect(body()).toContain('forbidden: loopback-only')
+    })
+
+    it('answers 403 for a cross-site browser marker on a loopback socket', async () => {
+      const registrations = capture(undefined, true)
+      const { res, status } = makeRes()
+      await registrations[0].handler(makeReq('POST', '{}', '/describe-image/attach', { headers: { 'sec-fetch-site': 'cross-site' } }), res)
+      expect(status()).toBe(403)
+    })
+
+    it('answers 403 for a cross-origin Origin header', async () => {
+      const registrations = capture(undefined, true)
+      const { res, status } = makeRes()
+      await registrations[0].handler(makeReq('POST', '{}', '/describe-image/attach', { headers: { origin: 'http://evil.example' } }), res)
+      expect(status()).toBe(403)
+    })
+
+    it('still attaches a same-origin loopback request carrying an Origin header', async () => {
+      const { store } = await makeCtx(true)
+      const registrations = capture(store, true)
+      const { res, status } = makeRes()
+      await registrations[0].handler(makeReq('POST', JSON.stringify({ data: PNG_BASE64, mediaType: 'image/png' }), '/describe-image/attach', { headers: { origin: 'http://127.0.0.1:3081' } }), res)
+      expect(status()).toBe(200)
+      expect(store?.saved).toHaveLength(1)
+    })
   })
 
   it('answers non-GET/non-POST requests with 405', async () => {
@@ -288,16 +390,85 @@ describe('registerAttachRoute', () => {
     expect(status()).toBe(400)
   })
 
+  it('scales the body cap with a higher configured maxBytes (no fixed 16 MiB wall)', async () => {
+    const registrations = capture(undefined, true, () => 20 * 1024 * 1024)
+    // A base64 payload that exceeds the old fixed 16 MiB cap but fits the
+    // scaled cap for a 20 MiB image bound.
+    const payload = JSON.stringify({ data: 'A'.repeat((16 * 1024 * 1024) + 4), mediaType: 'image/png' })
+    const { res, status } = makeRes()
+    await registrations[0].handler(makeReq('POST', payload), res)
+    // The body cap passed; the (fake) image is then rejected by payload
+    // validation (422), not by a fixed body cap (400).
+    expect(status()).toBe(422)
+  })
+
   it('stores a valid upload and returns the note with 200', async () => {
     const { store } = await makeCtx(true)
     const registrations = capture(store, true)
-    const { res, status, body } = makeRes()
+    const { res, status, body, headers } = makeRes()
     await registrations[0].handler(makeReq('POST', JSON.stringify({ data: PNG_BASE64, mediaType: 'image/png' })), res)
     expect(status()).toBe(200)
+    expect(headers()?.['content-type']).toBe('application/json; charset=utf-8')
+    expect(headers()?.['referrer-policy']).toBe('no-referrer')
     const envelope = JSON.parse(body()) as { ok: boolean; value?: { note: string } }
     expect(envelope.ok).toBe(true)
     expect(envelope.value?.note.startsWith('[image attachment {')).toBe(true)
     expect(store?.saved).toHaveLength(1)
+  })
+
+  it('serves a durable Markdown reference without the in-process id registry', async () => {
+    const { store } = await makeCtx(true)
+    const ref: ImageAttachmentRef = {
+      attachmentId: `sha256:${'b'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: 'image/png',
+      bytes: PNG_BYTES.length,
+      width: 1,
+      height: 1,
+    }
+    store?.stored.set(String(ref.attachmentId), PNG_BYTES)
+    expect(attachmentRefById(String(ref.attachmentId))).toBeUndefined()
+    const registrations = capture(store, true)
+    const { res, status } = makeRes()
+    const markdown = attachmentMarkdown(ref)
+    const path = /\(([^)]+)\)$/.exec(markdown)?.[1]
+    await registrations[0].handler(makeReq('GET', undefined, path), res)
+    expect(status()).toBe(200)
+  })
+
+  it('uses the attachment store canonical media type rather than URL metadata', async () => {
+    const { store } = await makeCtx(true)
+    const ref: ImageAttachmentRef = {
+      attachmentId: `sha256:${'9'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: 'image/png',
+      bytes: PNG_BYTES.length,
+      width: 1,
+      height: 1,
+    }
+    store?.stored.set(String(ref.attachmentId), PNG_BYTES)
+    if (store !== undefined) store.readRef = { ...ref, mediaType: 'image/jpeg' }
+    const registrations = capture(store, true)
+    const { res, status, headers } = makeRes()
+    const path = /\(([^)]+)\)$/.exec(attachmentMarkdown(ref))?.[1]
+    await registrations[0].handler(makeReq('GET', undefined, path), res)
+    expect(status()).toBe(200)
+    expect(headers()?.['content-type']).toBe('image/jpeg')
+  })
+
+  it('rejects a durable Markdown reference whose path and metadata disagree', async () => {
+    const { store } = await makeCtx(true)
+    const ref: ImageAttachmentRef = {
+      attachmentId: `sha256:${'e'.repeat(64)}` as ImageAttachmentRef['attachmentId'],
+      mediaType: 'image/png',
+      bytes: PNG_BYTES.length,
+      width: 1,
+      height: 1,
+    }
+    const markdown = attachmentMarkdown(ref).replace(`raw/${ref.attachmentId}`, `raw/sha256:${'f'.repeat(64)}`)
+    const path = /\(([^)]+)\)$/.exec(markdown)?.[1]
+    const registrations = capture(store, true)
+    const { res, status } = makeRes()
+    await registrations[0].handler(makeReq('GET', undefined, path), res)
+    expect(status()).toBe(404)
   })
 
   it('answers a rejected payload with 422 and the structured error', async () => {
@@ -317,5 +488,143 @@ describe('registerAttachRoute', () => {
     expect(status()).toBe(500)
     const envelope = JSON.parse(body()) as { ok: boolean; error: { code: string } }
     expect(envelope.error.code).toBe('internal')
+  })
+})
+
+describe('registerAttachRoute capability route', () => {
+  /** One fake GET request at the given URL. */
+  const makeGet = (url: string, overrides?: { remoteAddress?: string; headers?: Record<string, string> }): IncomingMessage => ({
+    method: 'GET',
+    url,
+    socket: { remoteAddress: overrides?.remoteAddress ?? '127.0.0.1' },
+    headers: { host: '127.0.0.1:3081', ...(overrides?.headers ?? {}) },
+    [Symbol.asyncIterator]: async function* () {},
+  } as unknown as IncomingMessage)
+
+  /** One fake response collecting status/headers/body. */
+  const makeRes = (): { res: ServerResponse; status: () => number; body: () => string } => {
+    let status = 0
+    let body = ''
+    const res = {
+      writeHead: (code: number) => { status = code },
+      end: (chunk?: unknown) => {
+        if (chunk !== undefined && chunk !== null) body += String(chunk)
+      },
+    } as unknown as ServerResponse
+    return { res, status: () => status, body: () => body }
+  }
+
+  /** Register the route with the given probe and return the captured handler. */
+  const captureWithProbe = (probe?: (sessionId: string) => Promise<{ acceptsImages: boolean; known: boolean }>) => {
+    const registrations: Array<{ kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }> = []
+    const webServer = { register: (row: { kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }) => { registrations.push(row); return () => {} } }
+    const ctx = { get: (key: string) => (key === 'webServer' ? webServer : undefined) }
+    registerAttachRoute(ctx as unknown as Context, undefined, probe)
+    return registrations
+  }
+
+  it('answers the probe verdict for the queried session', async () => {
+    const probe = vi.fn(async (sessionId: string) => ({ acceptsImages: sessionId === 'vision-session', known: true }))
+    const registrations = captureWithProbe(probe)
+    const { res, status, body } = makeRes()
+    await registrations[0].handler(makeGet('/describe-image/capability?session=vision-session'), res)
+    expect(status()).toBe(200)
+    expect(JSON.parse(body())).toEqual({ ok: true, value: { acceptsImages: true, known: true } })
+    expect(probe).toHaveBeenCalledWith('vision-session')
+  })
+
+  it('answers unknown-capability when no probe is registered', async () => {
+    const registrations = captureWithProbe()
+    const { res, status, body } = makeRes()
+    await registrations[0].handler(makeGet('/describe-image/capability?session=x'), res)
+    expect(status()).toBe(200)
+    expect(JSON.parse(body())).toEqual({ ok: true, value: { acceptsImages: false, known: false } })
+  })
+
+  it('answers unknown-capability when the session parameter is missing', async () => {
+    const probe = vi.fn(async () => ({ acceptsImages: true, known: true }))
+    const registrations = captureWithProbe(probe)
+    const { res, body } = makeRes()
+    await registrations[0].handler(makeGet('/describe-image/capability'), res)
+    expect(JSON.parse(body())).toEqual({ ok: true, value: { acceptsImages: false, known: false } })
+    expect(probe).not.toHaveBeenCalled()
+  })
+
+  it('keeps raw-image GETs on the raw path', async () => {
+    const registrations = captureWithProbe(async () => ({ acceptsImages: true, known: true }))
+    const { res, status } = makeRes()
+    await registrations[0].handler(makeGet('/describe-image/raw/sha256:missing'), res)
+    expect(status()).toBe(404)
+  })
+
+  it('answers 403 for a LAN socket before the probe runs', async () => {
+    const probe = vi.fn(async () => ({ acceptsImages: true, known: true }))
+    const registrations = captureWithProbe(probe)
+    const { res, status } = makeRes()
+    await registrations[0].handler(makeGet('/describe-image/capability?session=vision-session', { remoteAddress: '192.168.1.5' }), res)
+    expect(status()).toBe(403)
+    expect(probe).not.toHaveBeenCalled()
+  })
+})
+
+describe('attach route body failure contract (shared readJsonBody)', () => {
+  /** Async-iterable fake request with an exact destroy counter. */
+  function makeReq(body: string | undefined, destroySpy?: { calls: number }): IncomingMessage {
+    return {
+      method: 'POST',
+      url: '/describe-image/attach',
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: '127.0.0.1:3081', 'sec-fetch-site': 'same-origin' },
+      [Symbol.asyncIterator]: async function* () {
+        if (body !== undefined) yield Buffer.from(body)
+      },
+      destroy() {
+        if (destroySpy !== undefined) destroySpy.calls += 1
+        return this as never
+      },
+    } as unknown as IncomingMessage
+  }
+
+  /** Register the route against a fake webserver and return the handler. */
+  function capture(readMaxBytes?: () => number): { handler: (req: unknown, res: unknown) => Promise<void> } {
+    const registrations: Array<{ kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }> = []
+    const ctx = {
+      get: (key: string) => key === 'webServer'
+        ? { register: (row: { kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }) => { registrations.push(row); return () => {} } }
+        : undefined,
+    }
+    registerAttachRoute(ctx as unknown as Context, readMaxBytes)
+    return registrations[0]
+  }
+
+  /** One fake response collecting status/body. */
+  function makeRes(): { res: ServerResponse; status: () => number; body: () => string } {
+    let status = 0
+    let body = ''
+    const res = {
+      writeHead: (code: number) => { status = code },
+      end: (chunk?: unknown) => { if (chunk !== undefined && chunk !== null) body += String(chunk) },
+    } as unknown as ServerResponse
+    return { res, status: () => status, body: () => body }
+  }
+
+  it('answers an empty body with 400 without destroying the request', async () => {
+    const { handler } = capture()
+    const destroySpy = { calls: 0 }
+    const { res, status } = makeRes()
+    await handler(makeReq(undefined, destroySpy), res)
+    expect(status()).toBe(400)
+    expect(destroySpy.calls).toBe(0)
+  })
+
+  it('answers an oversized body with 400 and destroys the request', async () => {
+    // Zero image bound -> attachBodyCap(0) is 1024 bytes; a ~2 KiB body is past it.
+    const { handler } = capture(() => 0)
+    const destroySpy = { calls: 0 }
+    const { res, status } = makeRes()
+    const body = JSON.stringify({ data: 'x'.repeat(2048), mediaType: 'image/png' })
+    await handler(makeReq(body, destroySpy), res)
+    expect(status()).toBe(400)
+    expect(destroySpy.calls).toBe(1)
   })
 })

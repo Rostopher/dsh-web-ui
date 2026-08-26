@@ -7,7 +7,8 @@ import {
   classifySwitchFailure, extractBlockedPaths, validateBranchName,
 } from '../src/core/git-command.ts'
 import {
-  computeLanes, parseBranches, parseDecoration, parseGraph, parsePorcelain,
+  computeLanes, isBranchesView, isGitError, isGraphView, isRepoStatus,
+  parseBranches, parseDecoration, parseGraph, parsePorcelain,
   parseWorktreeBranches,
 } from '../src/core/types.ts'
 
@@ -30,6 +31,11 @@ describe('parsePorcelain', () => {
   it('counts dirty, untracked, and conflict entries', () => {
     const counts = parsePorcelain(' M a.ts\n?? new.txt\nUU conflict.txt\nA  staged.ts\n')
     expect(counts).toEqual({ dirtyFiles: 2, untrackedFiles: 1, conflicts: 1 })
+  })
+
+  it('counts AA/DD unmerged entries as conflicts, not dirty files', () => {
+    const counts = parsePorcelain('AA addadd.txt\nDD deldel.txt\n M plain.ts\n')
+    expect(counts).toEqual({ dirtyFiles: 1, untrackedFiles: 0, conflicts: 2 })
   })
 })
 
@@ -56,6 +62,10 @@ describe('parseDecoration', () => {
 
   it('returns nothing for an empty decoration', () => {
     expect(parseDecoration('')).toEqual([])
+  })
+
+  it('keeps ref names that start with HEAD and drops a bare detached HEAD', () => {
+    expect(parseDecoration('HEAD -> HEADfoo, HEAD')).toEqual(['HEADfoo'])
   })
 })
 
@@ -197,5 +207,46 @@ describe('computeLanes', () => {
     expect(lanes[2].nodeColumn).toBe(1)
     // The join lane ends into the shared ancestor's node.
     expect(lanes[3].columns).toEqual(['node', 'gap'])
+  })
+})
+
+describe('wire runtime guards', () => {
+  it('narrows a valid RepoStatus and rejects malformed ones', () => {
+    expect(isRepoStatus({
+  root: '/w', branch: 'main', head: 'abc1234', dirtyFiles: 0,
+  untrackedFiles: 1, conflicts: 0, operationInProgress: false,
+    })).toBe(true)
+    expect(isRepoStatus(null)).toBe(false)
+    expect(isRepoStatus({ root: '/w', branch: 'main', head: 'abc1234', dirtyFiles: 0 })).toBe(false)
+    expect(isRepoStatus({ root: '/w', branch: 'main', head: 'abc1234', dirtyFiles: 'x', untrackedFiles: 0, conflicts: 0, operationInProgress: false })).toBe(false)
+    expect(isRepoStatus({ root: '/w', branch: 'main', head: 'abc1234', dirtyFiles: 0, untrackedFiles: 0, conflicts: 0, operationInProgress: 'yes' })).toBe(false)
+  })
+
+  it('narrows a valid BranchesView and rejects wrong row shapes', () => {
+    const view = {
+      root: '/w', branch: 'main', dirtyFiles: 0, untrackedFiles: 0, conflicts: 0, operationInProgress: false,
+      branches: [{ name: 'main', current: true }, { name: 'feature/x', current: false }],
+    }
+    expect(isBranchesView(view)).toBe(true)
+    expect(isBranchesView({ ...view, branches: [{ name: 'main', current: 'yes' }] })).toBe(false)
+    expect(isBranchesView({ ...view, dirtyFiles: undefined })).toBe(false)
+  })
+
+  it('narrows a valid GraphView and rejects commit shape drift', () => {
+    const view = {
+      root: '/w', branch: 'main', hasMore: false,
+      commits: [{ oid: 'a1', parents: ['b1'], subject: 's', author: 'A', authorTime: 0, refs: ['main'] }],
+    }
+    expect(isGraphView(view)).toBe(true)
+    expect(isGraphView({ ...view, commits: [{ oid: 'a1', parents: ['b1'], subject: 's', author: 'A', authorTime: 'x', refs: [] }] })).toBe(false)
+    expect(isGraphView({ ...view, hasMore: 'yes' })).toBe(false)
+  })
+
+  it('narrows a valid GitError and rejects unknown codes or type drift', () => {
+    expect(isGitError({ code: 'conflicts-present', message: 'nope' })).toBe(true)
+    expect(isGitError({ code: 'conflicts-present', message: 'nope', paths: ['a.ts'], moreFiles: 0 })).toBe(true)
+    expect(isGitError({ code: 'conflicts-present', message: 'nope', paths: [1] })).toBe(false)
+    expect(isGitError({ code: 'not-a-code', message: 'nope' })).toBe(false)
+    expect(isGitError({ code: 'internal', message: 42 })).toBe(false)
   })
 })

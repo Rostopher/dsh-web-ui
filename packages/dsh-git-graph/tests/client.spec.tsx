@@ -8,16 +8,23 @@
  * the create/graph dialogs behave (validation, duplicate copy, lane
  * rendering).
  */
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 import type { BranchesView, GraphView, RepoStatus, SwitchResult } from '../src/core/types.ts'
 import type { GitGraphInjected } from '../src/client/index.ts'
 import type { BranchChipProps } from '../src/client/chips/BranchChip.tsx'
 import { BranchChip } from '../src/client/chips/BranchChip.tsx'
+import { GraphDialog } from '../src/client/graph/GraphDialog.tsx'
 import { zh, type GitGraphKey } from '../src/client/locales.ts'
+import css from '../src/client/chips/context.module.css'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  for (const name of document.body.getAttributeNames()) {
+    if (name.startsWith('data-dsh-') || name === 'data-ds-dark-theme') document.body.removeAttribute(name)
+  }
+})
 
 const sid = (value: string): SessionId => value as SessionId
 
@@ -114,13 +121,14 @@ function bench(options: BenchOptions = {}, seat: BenchSeat = 'context') {
     subscribeChanges: vi.fn((sessionId: SessionId | undefined, _onChange: () => void) => { record('subscribeChanges', sessionId); return () => {} }),
   }
 
+  const blank = options.blank ?? seat === 'context'
   const sessionsState = {
-    byId: { [sessionId]: { cwd, blank: options.blank === true } },
+    byId: { [sessionId]: { cwd, blank } },
   }
   const commonProps = {
     // The context/dock holes read their state from the standard session kit +
     // the inject face; the dock seat additionally carries the conversation
-    // snapshot (and indents the chip to the input card start).
+    // snapshot used to identify the blank hero phase.
     useSession: (() => undefined) as never,
     useSessions: ((selector: (state: typeof sessionsState) => unknown) => selector(sessionsState)) as never,
     useWorkspaces: (() => undefined) as never,
@@ -158,63 +166,61 @@ describe('BranchChip', () => {
     expect(branchChip.textContent).toContain('main')
   })
 
+  it('opts the chip anchor into the L2 semantic attributes (#506)', async () => {
+    bench()
+    const branchChip = await screen.findByRole('button', { name: '分支' })
+    const anchor = anchorOf(branchChip)
+    expect(anchor.getAttribute('data-dsh-plugin')).toBe('git-graph')
+    expect(anchor.getAttribute('data-dsh-part')).toBe('chip')
+  })
+
+  it('marks only the unskinned light skin-center page for stock-light fallback styles', async () => {
+    document.body.setAttribute('data-dsh-skin-center', '')
+    bench()
+    const branchChip = await screen.findByRole('button', { name: '分支' })
+    const anchor = anchorOf(branchChip)
+    expect(anchor.getAttribute('data-gitgraph-stock-light')).toBe('true')
+
+    act(() => { document.body.setAttribute('data-dsh-xp', '') })
+    await waitFor(() => { expect(anchor.hasAttribute('data-gitgraph-stock-light')).toBe(false) })
+
+    act(() => { document.body.removeAttribute('data-dsh-xp') })
+    await waitFor(() => { expect(anchor.getAttribute('data-gitgraph-stock-light')).toBe('true') })
+
+    act(() => { document.body.setAttribute('data-ds-dark-theme', '') })
+    await waitFor(() => { expect(anchor.hasAttribute('data-gitgraph-stock-light')).toBe(false) })
+  })
+
   it('keeps the branch chip in a blank (hero) session — the selector row stays docked', async () => {
     bench({ blank: true })
     const branchChip = await screen.findByRole('button', { name: '分支' })
     expect(branchChip.textContent).toContain('main')
   })
 
-  it('shows the chip on the dock seat above the composer card', async () => {
-    bench({}, 'dock')
-    const branchChip = await screen.findByRole('button', { name: '分支' })
-    expect(branchChip.textContent).toContain('main')
+  it('hides the branch selector in active dock sessions', async () => {
+    const { injected } = bench({}, 'dock')
+    await act(async () => {})
+    expect(screen.queryByRole('button', { name: '分支' })).toBeNull()
+    expect(injected.repoStatus).not.toHaveBeenCalled()
+    expect(injected.subscribeChanges).not.toHaveBeenCalled()
   })
 
-  it('indents the dock copy so it starts flush with the input card', async () => {
-    bench({}, 'dock')
-    const branchChip = await screen.findByRole('button', { name: '分支' })
-    // The dock row spans the composer stack; only the dock seat carries the
-    // side-clearance indent that aligns the chip with the input card below.
-    // The chip's parent is the positioning wrapper; the outer anchor owns
-    // the indent padding.
-    const chipWrap = branchChip.parentElement as HTMLElement
-    expect(chipWrap.className).toContain('chipWrap')
-    expect(chipWrap.contains(branchChip)).toBe(true)
-    const anchor = anchorOf(branchChip)
-    expect(anchor.className).toContain('anchorDock')
+  it('hides the branch selector in active context sessions', async () => {
+    const { injected } = bench({ blank: false })
+    await act(async () => {})
+    expect(screen.queryByRole('button', { name: '分支' })).toBeNull()
+    expect(injected.repoStatus).not.toHaveBeenCalled()
+    expect(injected.subscribeChanges).not.toHaveBeenCalled()
   })
 
-  it('measures the input card left edge and applies it as the dock indent', async () => {
-    const card = document.createElement('div')
-    card.setAttribute('data-composer-card', '')
-    document.body.append(card)
-    try {
-      const { view } = bench({}, 'dock')
-      const chip = await screen.findByRole('button', { name: '分支' })
-      const chipWrap = chip.parentElement as HTMLElement
-      expect(chipWrap.className).toContain('chipWrap')
-      const anchor = anchorOf(chip)
-      anchor.getBoundingClientRect = () => ({
-        left: 540, right: 1344, top: 0, bottom: 24, width: 804, height: 24, x: 540, y: 0, toJSON: () => ({}),
-      }) as DOMRect
-      card.getBoundingClientRect = () => ({
-        left: 600, right: 1380, top: 0, bottom: 100, width: 780, height: 100, x: 600, y: 0, toJSON: () => ({}),
-      }) as DOMRect
-      await act(async () => {
-        window.dispatchEvent(new Event('resize'))
-        await nextFrame()
-      })
-      expect(anchor.style.paddingLeft).toBe('60px')
-      expect(view.unmount).toBeTruthy()
-    } finally {
-      card.remove()
-    }
-  })
-
-  it('keeps the context copy without the dock indent', async () => {
-    bench()
-    const branchChip = await screen.findByRole('button', { name: '分支' })
-    expect(anchorOf(branchChip).className).not.toContain('anchorDock')
+  it('keeps the full pill in the blank hero and context seats', async () => {
+    bench({ blank: true, composerPhase: 'blank' }, 'dock')
+    const heroChip = await screen.findByRole('button', { name: '分支' })
+    expect(heroChip.className).toContain('chipHero')
+    cleanup()
+    bench({ blank: true })
+    const contextChip = await screen.findByRole('button', { name: '分支' })
+    expect(contextChip.className).not.toContain('chipHero')
   })
 
   it('styles the dock chip with the official hero seat in the blank phase', async () => {
@@ -294,7 +300,12 @@ describe('BranchChip', () => {
     fireEvent.click(await screen.findByRole('button', { name: '分支' }))
     fireEvent.click(await screen.findByRole('option', { name: 'feature/x' }))
     expect(calls.switchBranch).toEqual([['sess-1', 'feature/x']])
-    expect(await screen.findByText('已切换到分支 feature/x')).toBeTruthy()
+    const notice = await screen.findByText('已切换到分支 feature/x')
+    // The success banner carries the base notice class plus the ok variant
+    // (the variant re-tints the banner; losing it would paint success as an
+    // error banner).
+    expect(notice.classList.contains(css.notice)).toBe(true)
+    expect(notice.classList.contains(css.noticeOk)).toBe(true)
     expect(injected.switchBranch).toHaveBeenCalled()
   })
 
@@ -304,7 +315,10 @@ describe('BranchChip', () => {
     })
     fireEvent.click(await screen.findByRole('button', { name: '分支' }))
     fireEvent.click(await screen.findByRole('option', { name: 'feature/x' }))
-    expect(await screen.findByText('当前仓库还有未解决的冲突，先处理完再切换分支。')).toBeTruthy()
+    const notice = await screen.findByText('当前仓库还有未解决的冲突，先处理完再切换分支。')
+    // The error banner is the base notice only (never the ok variant).
+    expect(notice.classList.contains(css.notice)).toBe(true)
+    expect(notice.classList.contains(css.noticeOk)).toBe(false)
   })
 
   it('shows the overwrite copy with blocked paths', async () => {
@@ -383,5 +397,228 @@ describe('BranchChip', () => {
       hasMore: false,
     })
     expect(await screen.findByText('root commit')).toBeTruthy()
+  })
+
+  it('throttles focus refetches to one per 5s window', async () => {
+    // now starts past the initial lastFocusRefetch (0) so the FIRST focus is
+    // the one consumed by the throttle window (a second burst focus is held).
+    vi.useFakeTimers({ now: 10_000 })
+    try {
+      const { injected } = bench()
+      // Flush the initial mount load so the throttle deltas are relative to it.
+      await act(async () => {})
+      const initialCalls = injected.repoStatus.mock.calls.length
+
+      await act(async () => { window.dispatchEvent(new Event('focus')) })
+      await act(async () => {})
+      expect(injected.repoStatus.mock.calls.length).toBe(initialCalls + 1)
+
+      // A second focus inside the 5s window is throttled: no new call.
+      await act(async () => { window.dispatchEvent(new Event('focus')) })
+      await act(async () => {})
+      expect(injected.repoStatus.mock.calls.length).toBe(initialCalls + 1)
+
+      // The window elapses; the next focus refetches again.
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      await act(async () => { window.dispatchEvent(new Event('focus')) })
+      await act(async () => {})
+      expect(injected.repoStatus.mock.calls.length).toBe(initialCalls + 2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('GraphDialog', () => {
+  it('opts the dialog into the L2 semantic attributes (#506)', async () => {
+    render(
+      <GraphDialog
+        graph={async () => ({
+          root: '/ws/proj', branch: 'main',
+          commits: [
+            { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+          ],
+          hasMore: false,
+        })}
+        onClose={() => {}}
+        t={makeTranslate()}
+      />,
+    )
+    const dialog = await screen.findByRole('dialog', { name: 'Git 图谱' })
+    expect(dialog.getAttribute('data-gitgraph-dialog')).not.toBeNull()
+    expect(dialog.getAttribute('data-dsh-plugin')).toBe('git-graph')
+    expect(dialog.getAttribute('data-dsh-part')).toBe('dialog')
+    expect(await screen.findByText('root commit')).toBeTruthy()
+  })
+
+  it('does not re-run the initial load when the graph prop identity changes', async () => {
+    const calls: number[] = []
+    const graph = async (limit?: number) => {
+      calls.push(limit ?? 0)
+      return {
+        root: '/ws/proj', branch: 'main',
+        commits: [
+          { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+        ],
+        hasMore: false,
+      }
+    }
+    const { rerender } = render(
+      <GraphDialog graph={graph} onClose={() => {}} t={makeTranslate()} />,
+    )
+    await screen.findByText('root commit')
+    const callsAfterMount = calls.length
+    // The initial load ran with the page size.
+    expect(calls).toEqual([200])
+
+    // A parent re-render passes a fresh inline arrow → graph identity changes.
+    rerender(
+      <GraphDialog
+        graph={async (limit?: number) => {
+          calls.push(limit ?? 0)
+          return {
+            root: '/ws/proj', branch: 'main',
+            commits: [
+              { oid: 'aabbcc', parents: [], subject: 'root commit', author: 'Bob', authorTime: 1690000000, refs: [] },
+            ],
+            hasMore: false,
+          }
+        }}
+        onClose={() => {}}
+        t={makeTranslate()}
+      />,
+    )
+    // No new initial fetch: the effect is mount-only.
+    expect(calls.length).toBe(callsAfterMount)
+  })
+})
+describe('branch name tooltip', () => {
+  const LONG_A = 'feature/very-long-branch-name-over-eighteen-chars'
+  const LONG_B = 'feature/another-long-branch-name-exceeding-limit'
+  const longBranchesView: BranchesView = {
+    root: '/ws/proj', branch: 'main',
+    branches: [
+      { name: LONG_A, current: false },
+      { name: 'main', current: true },
+    ],
+    dirtyFiles: 0, untrackedFiles: 0, conflicts: 0, operationInProgress: false,
+  }
+
+  it('keeps the native title and adds aria-label on long names', async () => {
+    bench({ branchesView: longBranchesView })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const long = await screen.findByRole('option', { name: LONG_A })
+    expect(long.getAttribute('data-tip')).toBe(LONG_A)
+    // Pointer-independent fallback stays intact: aria-label on the button
+    // and the native title on the name span (keyboard / SR / touch).
+    expect(long.getAttribute('aria-label')).toBe(LONG_A)
+    const name = long.querySelector('[class*=itemName]')
+    expect(name?.getAttribute('title')).toBe(LONG_A)
+  })
+
+  it('keeps data-tip empty on short names', async () => {
+    bench()
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const short = await screen.findByRole('option', { name: 'feature/x' })
+    expect(short.getAttribute('data-tip')).toBe('')
+    const name = short.querySelector('[class*=itemName]')
+    expect(name?.getAttribute('title')).toBe('feature/x')
+  })
+
+  it('defers tooltip readiness until the 500ms dwell elapses', async () => {
+    bench({ branchesView: longBranchesView })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const long = await screen.findByRole('option', { name: LONG_A })
+    expect(long.getAttribute('data-tip-ready')).toBe('')
+    vi.useFakeTimers()
+    try {
+      fireEvent.mouseEnter(long)
+      act(() => { vi.advanceTimersByTime(499) })
+      expect(long.getAttribute('data-tip-ready')).toBe('')
+      act(() => { vi.advanceTimersByTime(2) })
+      expect(long.getAttribute('data-tip-ready')).toBe('true')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows the tooltip immediately when switching items after one is visible', async () => {
+    bench({ branchesView: { ...longBranchesView, branches: [...longBranchesView.branches, { name: LONG_B, current: false }] } })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const first = await screen.findByRole('option', { name: LONG_A })
+    const second = screen.getByRole('option', { name: LONG_B })
+    vi.useFakeTimers()
+    try {
+      fireEvent.mouseEnter(first)
+      act(() => { vi.advanceTimersByTime(500) })
+      expect(first.getAttribute('data-tip-ready')).toBe('true')
+      // Realistic pointer move: entering another row while the bubble is
+      // visible shows it at once (row-level leave has no handler; only the
+      // list-level leave below resets the instant-handoff state).
+      fireEvent.mouseEnter(second)
+      expect(second.getAttribute('data-tip-ready')).toBe('true')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resets readiness only when the pointer leaves the whole list', async () => {
+    bench({ branchesView: longBranchesView })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const long = await screen.findByRole('option', { name: LONG_A })
+    vi.useFakeTimers()
+    try {
+      fireEvent.mouseEnter(long)
+      act(() => { vi.advanceTimersByTime(500) })
+      expect(long.getAttribute('data-tip-ready')).toBe('true')
+      // Leaving the whole list resets readiness (re-arms the dwell).
+      const list = long.parentElement
+      expect(list).not.toBeNull()
+      fireEvent.mouseLeave(list as HTMLElement)
+      expect(long.getAttribute('data-tip-ready')).toBe('')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('clears the dwell timer on unmount', async () => {
+    bench({ branchesView: longBranchesView })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const long = await screen.findByRole('option', { name: LONG_A })
+    vi.useFakeTimers()
+    try {
+      fireEvent.mouseEnter(long)
+      cleanup()
+      // Advancing past the dwell must not throw after unmount (timer cleared).
+      expect(() => { act(() => { vi.advanceTimersByTime(600) }) }).not.toThrow()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('flips the bubble below for items near the top of the list', async () => {
+    bench({ branchesView: longBranchesView })
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const long = await screen.findByRole('option', { name: LONG_A })
+    // jsdom rects are all zero, so itemTop - listTop (0) < 56 → 'down'.
+    fireEvent.mouseEnter(long)
+    expect(long.getAttribute('data-tip-dir')).toBe('down')
+  })
+})
+
+describe('popover search box focus', () => {
+  it('auto-focuses the search input when the popover opens', async () => {
+    bench()
+    const chip = await screen.findByRole('button', { name: '分支' })
+    fireEvent.click(chip)
+    const input = await screen.findByPlaceholderText(/搜索分支/)
+    expect(document.activeElement).toBe(input)
   })
 })

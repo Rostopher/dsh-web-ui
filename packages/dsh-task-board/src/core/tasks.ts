@@ -29,9 +29,29 @@ export interface ExecutionRecord {
 }
 
 /**
- * A scheduled-run rule attached to a task. The browser-side scheduler ticks
- * every minute and triggers the task when `nextRunAt` is due; the rule is
- * persisted with the task (localStorage), so scheduling survives refreshes.
+ * Maximum number of execution records retained per task. Older settled runs
+ * are trimmed when a new execution starts so per-action ledger cost stays
+ * bounded regardless of how often a task ran before.
+ */
+export const EXECUTION_HISTORY_LIMIT = 20
+
+/**
+ * Trim an execution list to at most {@link EXECUTION_HISTORY_LIMIT} records,
+ * most recent last. A running (unsettled) execution is never trimmed: the
+ * Host monitor and restart recovery depend on the active record, and a task
+ * cannot start a new run while one is still open.
+ */
+export function retainRecentExecutions(executions: readonly ExecutionRecord[]): ExecutionRecord[] {
+  if (executions.length <= EXECUTION_HISTORY_LIMIT) return [...executions]
+  const open = executions.filter(execution => execution.endedAt === undefined)
+  const settled = executions.filter(execution => execution.endedAt !== undefined)
+  const keepSettled = Math.max(EXECUTION_HISTORY_LIMIT - open.length, 0)
+  return [...settled.slice(Math.max(settled.length - keepSettled, 0)), ...open]
+}
+
+/**
+ * A scheduled-run rule attached to a task. The Host scheduler triggers the
+ * task when `nextRunAt` is due and persists the rule in the Host ledger.
  */
 export interface ScheduleRule {
   /** Whether the schedule is armed. */
@@ -60,10 +80,49 @@ export interface TaskRecord {
   createdAt: number
   /** Last mutation instant (ms epoch). */
   updatedAt: number
-  /** Every execution attempt, most recent last. */
+  /**
+   * Execution history retained on the task, most recent last: the latest
+   * {@link EXECUTION_HISTORY_LIMIT} attempts, oldest trimmed on append.
+   */
   executions: ExecutionRecord[]
   /** Optional scheduled-run rule (absent on tasks without a schedule). */
   schedule?: ScheduleRule
+  /**
+   * Workspace the execution must run in (a workspace-list id); absent means
+   * the recent-workspace fallback at execution time.
+   */
+  workspaceId?: string
+  /**
+   * Agent preset the execution session must be composed from (an
+   * `agentPreset.list` id); absent means the deployment default.
+   */
+  mode?: string
+  /**
+   * Permission preset applied to the execution session through the
+   * `/permission <id>` slash command; absent leaves the session default.
+   */
+  permission?: TaskPermission
+  /**
+   * When the task was archived (ms epoch). Archived tasks keep their status
+   * and execution history, leave the main board, and cannot run until restored;
+   * absent means on-board.
+   */
+  archivedAt?: number
+}
+
+/** Statuses a settled task may be archived from. */
+export const ARCHIVABLE_STATUSES: readonly TaskStatus[] = ['done', 'failed']
+
+
+/** Permission presets a task may pin on its execution session (the `/permission <id>` ids). */
+export const TASK_PERMISSIONS = ['read-only', 'workspace-write', 'danger-full-access'] as const
+
+/** One permission preset id. */
+export type TaskPermission = typeof TASK_PERMISSIONS[number]
+
+/** Whether an unknown value is a known permission preset id. */
+export function isTaskPermission(value: unknown): value is TaskPermission {
+  return typeof value === 'string' && (TASK_PERMISSIONS as readonly string[]).includes(value)
 }
 
 /** Input for creating a task. */
@@ -71,6 +130,18 @@ export interface NewTaskInput {
   title: string
   description: string
   prompt: string
+  /** Workspace the execution must run in; empty/absent = the recent workspace. */
+  workspaceId?: string
+  /** Agent preset the execution session must be composed from; empty/absent = deployment default. */
+  mode?: string
+  /** Permission preset applied to the execution session; absent = session default. */
+  permission?: TaskPermission
+  /**
+   * Optional scheduled-run rule requested at creation time (the new-task
+   * dialog): an enable flag plus a 5-field cron expression. The create use
+   * case arms it only when enabled and the expression is valid.
+   */
+  schedule?: { enabled: boolean; cron: string }
 }
 
 /** The five kanban columns, in display order. */
@@ -99,8 +170,14 @@ export function isTaskStatus(value: unknown): value is TaskStatus {
 }
 
 /** Whether a manual move target is allowed from the given status. */
-export function canMoveManually(_from: TaskStatus, to: TaskStatus): boolean {
-  return (MANUAL_STATUSES as readonly TaskStatus[]).includes(to)
+export function canMoveManually(from: TaskStatus, to: TaskStatus): boolean {
+  return from !== 'running' && (MANUAL_STATUSES as readonly TaskStatus[]).includes(to)
+}
+
+/** Normalize one optional execution-target string: trim; blank collapses to undefined. */
+export function normalizeTargetId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  return trimmed === undefined || trimmed === '' ? undefined : trimmed
 }
 
 /** Create a task from user input. */
@@ -114,6 +191,9 @@ export function createTask(input: NewTaskInput, now: number, id: string): TaskRe
     createdAt: now,
     updatedAt: now,
     executions: [],
+    workspaceId: normalizeTargetId(input.workspaceId),
+    mode: normalizeTargetId(input.mode),
+    permission: isTaskPermission(input.permission) ? input.permission : undefined,
   }
 }
 
@@ -165,7 +245,12 @@ export function startExecution(
     error: undefined,
   }
   return {
-    task: { ...task, status: 'running', updatedAt: now, executions: [...task.executions, execution] },
+    task: {
+      ...task,
+      status: 'running',
+      updatedAt: now,
+      executions: retainRecentExecutions([...task.executions, execution]),
+    },
     execution,
   }
 }

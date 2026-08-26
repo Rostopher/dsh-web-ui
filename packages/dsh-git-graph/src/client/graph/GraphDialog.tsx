@@ -4,7 +4,7 @@
  * @module dsh-git-graph/client/graph/GraphDialog
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { IconCloseOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import { computeLanes, type LaneGlyph } from '../../core/types.ts'
@@ -68,17 +68,32 @@ export function GraphDialog({ graph, onClose, t }: GraphDialogProps) {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
+  // Out-of-order guard: two rapid loads (load-more while a fetch is in
+  // flight) must never let the older, smaller page overwrite the newer one.
+  const requestSeq = useRef(0)
   const load = useCallback((limit: number): void => {
+    const seq = requestSeq.current + 1
+    requestSeq.current = seq
     setLoading(true)
     void graph(limit).then((next) => {
+      if (seq !== requestSeq.current) return
       setView(next)
       setError(next === null ? t('error.internal') : null)
     }).catch(() => {
+      if (seq !== requestSeq.current) return
       setError(t('error.internal'))
-    }).finally(() => { setLoading(false) })
+    }).finally(() => {
+      if (seq === requestSeq.current) setLoading(false)
+    })
   }, [graph, t])
 
-  useEffect(() => { load(INITIAL_LIMIT) }, [load])
+  // Initial load exactly once on mount. The parent passes a fresh inline
+  // `graph` arrow on every BranchChip render, which changes `load`'s identity
+  // and would re-run the initial fetch (resetting any loaded pages) if it
+  // were a dependency — so read the latest `load` through a ref instead.
+  const loadRef = useRef(load)
+  loadRef.current = load
+  useEffect(() => { loadRef.current(INITIAL_LIMIT) }, [])
 
   const lanes = useMemo(() => {
     if (view === null) return []
@@ -94,7 +109,7 @@ export function GraphDialog({ graph, onClose, t }: GraphDialogProps) {
   return (
     <>
       <Backdrop onClose={onClose} />
-      <div className={css.dialog} role="dialog" aria-label={t('graph.title')} data-gitgraph-dialog>
+      <div className={css.dialog} role="dialog" aria-label={t('graph.title')} data-gitgraph-dialog data-dsh-plugin="git-graph" data-dsh-part="dialog">
         <div className={css.dialogHeader}>
           <div className={css.dialogHeading}>
             <h3 className={css.dialogTitle}>{t('graph.title')}</h3>

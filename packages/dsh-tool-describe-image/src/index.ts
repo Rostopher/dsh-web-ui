@@ -8,457 +8,97 @@
  *
  * Ported from deepseek-harness packages/vision/tool-describe-image (mirrored at
  * whitelonng/dsh-plugin-describe-image). Family adaptation: the plugin may be mounted without
- * configuration (the dsh-web-ui-all aggregate does this), so endpoint/model validation happens per
+ * configuration (the dsh-web-all aggregate does this), so endpoint/model validation happens per
  * call — or eagerly at load when a composition entry actually configures it. The "Image
  * understanding" settings section can fill the fields live from Settings → 插件配置.
  * @module @linxin666/dsh-tool-describe-image
  */
 
-import { readFile, stat } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
-import z from 'schemastery'
-import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { installSettingsSection } from '@deepseek-ai/dsh-settings'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import { attachmentRefById, registerAttachRoute } from './attach-routes.ts'
-import { DEFAULT_MAX_BYTES, sniffMimeType, type ImageMimeType } from './media.ts'
+import { registerAttachRoute, registerModelRoutes } from './attach-routes.ts'
+import { DEFAULT_MAX_BYTES } from './media.ts'
+import { createCapabilityProbe, createRouteResolver } from './model-capability.ts'
+import { installToolVisibility } from './tool-visibility.ts'
+import { registerNativeImageRoutes } from './native-images.ts'
+import { Config, DESCRIBE_IMAGE_SETTINGS_NAMESPACE, resolveApiKey, resolveConfig, type ResolvedConfig } from './config-resolve.ts'
+import { callVision, createVisionCache, loadImage } from './vision-client.ts'
+import { mountOnce } from './mount-once.ts'
 
 export const name = 'describe-image'
 export const inject = ['tools', 'webServer']
 
-/** Environment-variable name the API key resolves through when no inline key is configured. */
-export const DEFAULT_API_KEY_ENV = 'VISION_API_KEY'
-/** Per-call output-token cap sent to the vision model. */
-export const DEFAULT_MAX_OUTPUT_TOKENS = 1024
-/** Per-call vision request timeout in milliseconds. */
-export const DEFAULT_TIMEOUT_MS = 60_000
-/** Protocol styles the tool can speak to the configured endpoint. */
-export const API_STYLES = ['chat-completions', 'responses'] as const
-export type ApiStyle = typeof API_STYLES[number]
-/** Protocol style used unless the configuration overrides it. */
-export const DEFAULT_API_STYLE: ApiStyle = 'chat-completions'
-/** Instruction sent when the model does not pass its own prompt. */
-export const DEFAULT_PROMPT =
-  'Analyze this image: describe what is visible factually, transcribe legible text verbatim, and call out layout, notable details, or anything anomalous.'
+// Public surface re-exported unchanged from the split modules. Config and its
+// schema const travel together from config-resolve; the settings namespace the
+// Plugins card uses comes from the same module.
 
 export { DEFAULT_MAX_BYTES, sniffMimeType } from './media.ts'
 export type { ImageMimeType } from './media.ts'
-
-/**
- * Deployment configuration for the describe-image tool. The interface keeps every field optional so
- * programmatic construction is re-judged by {@link resolveConfig}; the schema requires `baseURL` and
- * `model` for composition entries.
- */
-export interface Config {
-  /** Root of the OpenAI-compatible endpoint, e.g. `https://api.openai.com/v1`; trailing slashes are stripped. */
-  baseURL?: string
-  /** Vision model id for the configured endpoint. */
-  model?: string
-  /** Inline API key; prefer `apiKeyEnv` with the credential seam. Feed from the environment via `!!js process.env.VISION_API_KEY`. */
-  apiKey?: string
-  /** Credential reference (environment-variable name) for the API key; defaults to `VISION_API_KEY`. */
-  apiKeyEnv?: string
-  /** Instruction used when a call omits its `prompt`; defaults to a concise factual description. */
-  defaultPrompt?: string
-  /** Image byte bound; defaults to {@link DEFAULT_MAX_BYTES}. */
-  maxBytes?: number
-  /** Output-token cap sent to the vision model; defaults to {@link DEFAULT_MAX_OUTPUT_TOKENS}. */
-  maxOutputTokens?: number
-  /** Per-call request timeout; defaults to {@link DEFAULT_TIMEOUT_MS}. */
-  timeoutMs?: number
-  /** Protocol style of the endpoint; defaults to {@link DEFAULT_API_STYLE} (`chat-completions`). */
-  apiStyle?: ApiStyle
-}
-
-/** Schemastery configuration for the describe-image tool; doubles as the `describe-image` settings-section schema. */
-export const Config: z<Config> = z.object({
-  baseURL: z.string(),
-  model: z.string(),
-  apiKey: z.string().role('secret'),
-  apiKeyEnv: z.string().role('credential-ref').default(DEFAULT_API_KEY_ENV),
-  defaultPrompt: z.string().default(DEFAULT_PROMPT),
-  maxBytes: z.number().step(1).min(1).default(DEFAULT_MAX_BYTES),
-  maxOutputTokens: z.number().step(1).min(1).default(DEFAULT_MAX_OUTPUT_TOKENS),
-  timeoutMs: z.number().min(1).default(DEFAULT_TIMEOUT_MS),
-  apiStyle: z.union(API_STYLES).default(DEFAULT_API_STYLE),
-})
-
-/** Settings namespace carrying the endpoint, model, and key reference the Plugins card edits. */
-export const DESCRIBE_IMAGE_SETTINGS_NAMESPACE = settingsNamespace('describe-image')
-
-/** One resolved, validated configuration snapshot; defaults and beyond-schema constraints applied. */
-export interface ResolvedConfig {
-  baseURL: string
-  model: string
-  apiKey: string | undefined
-  apiKeyEnv: CredentialRef | undefined
-  defaultPrompt: string
-  maxBytes: number
-  maxOutputTokens: number
-  timeoutMs: number
-  apiStyle: ApiStyle
-}
-
-/** One loaded image: its bytes and the sniffed media type. */
-export interface LoadedImage {
-  bytes: Buffer
-  mimeType: ImageMimeType
-}
-
-/**
- * Resolve raw config into validated connection facts. Programmatic construction may bypass
- * Schemastery normalization, so every default and bound is re-judged here; a non-empty composition
- * entry is validated at load so misconfiguration fails loud (an unconfigured family mount only
- * hits it per call, inside {@link apply}).
- * @param config - raw plugin config.
- * @returns validated facts.
- */
-export function resolveConfig(config: Config): ResolvedConfig {
-  const baseURL = (config.baseURL ?? '').trim().replace(/\/+$/, '')
-  if (!/^https?:\/\//.test(baseURL)) {
-    throw new Error('describe-image: baseURL must be an absolute http(s) URL')
-  }
-  const model = (config.model ?? '').trim()
-  if (model.length === 0) throw new Error('describe-image: model must be a non-empty model id')
-  const apiKey = config.apiKey
-  if (apiKey !== undefined && apiKey.length === 0) {
-    throw new Error('describe-image: apiKey must be non-empty when set')
-  }
-  let apiKeyEnv: CredentialRef | undefined
-  const rawEnv = config.apiKeyEnv ?? DEFAULT_API_KEY_ENV
-  if (rawEnv.length > 0) {
-    try {
-      apiKeyEnv = credentialRef(rawEnv)
-    } catch {
-      throw new Error(`describe-image: apiKeyEnv ${JSON.stringify(rawEnv)} is not a valid environment-variable name`)
-    }
-  }
-  const maxBytes = config.maxBytes ?? DEFAULT_MAX_BYTES
-  const maxOutputTokens = config.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS
-  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  const apiStyle = config.apiStyle ?? DEFAULT_API_STYLE
-  for (const [field, value] of [['maxBytes', maxBytes], ['maxOutputTokens', maxOutputTokens], ['timeoutMs', timeoutMs]] as const) {
-    if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new Error(`describe-image: ${field} must be a positive safe integer`)
-    }
-  }
-  if (!API_STYLES.includes(apiStyle)) {
-    throw new Error(`describe-image: apiStyle must be one of ${API_STYLES.map(style => JSON.stringify(style)).join(', ')}`)
-  }
-  return { baseURL, model, apiKey, apiKeyEnv, defaultPrompt: config.defaultPrompt ?? DEFAULT_PROMPT, maxBytes, maxOutputTokens, timeoutMs, apiStyle }
-}
-
-/**
- * Resolve the API key for one call: an explicit inline key wins; otherwise the credential seam (which owns
- * environment and managed-store layers) resolves the reference; without the seam the launch environment is
- * the whole credential plane.
- * @param ctx - registrant context.
- * @param spec - validated configuration.
- * @returns the resolved key.
- */
-export async function resolveApiKey(ctx: Context, spec: ResolvedConfig): Promise<string> {
-  if (spec.apiKey !== undefined) return spec.apiKey
-  if (spec.apiKeyEnv !== undefined) {
-    const credentials = ctx.get('credentials')
-    if (credentials !== undefined) {
-      const hit = await credentials.resolve(spec.apiKeyEnv)
-      if (hit !== undefined) return hit.value
-    } else {
-      const ambient = launchEnvironmentOf(ctx).get(spec.apiKeyEnv)
-      if (ambient !== undefined && ambient.value.length > 0) return ambient.value
-    }
-  }
-  throw new Error(
-    `describe-image: no API key; set apiKey, store ${spec.apiKeyEnv ?? DEFAULT_API_KEY_ENV} through the credentials service,`
-    + ' or export it in the launching environment',
-  )
-}
-
-/**
- * Read a response body up to a byte cap, rejecting the whole response beyond it.
- * @param response - the response to drain.
- * @param cap - the byte bound.
- * @returns the accumulated body bytes.
- */
-export async function readBoundedBody(response: Response, cap: number): Promise<Buffer> {
-  if (response.body === null) return Buffer.alloc(0)
-  const reader = response.body.getReader()
-  const chunks: Buffer[] = []
-  let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      const chunk = Buffer.from(value)
-      total += chunk.length
-      if (total > cap) throw new Error(`describe-image: response exceeds the ${cap}-byte bound`)
-      chunks.push(chunk)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  return Buffer.concat(chunks)
-}
-
-/**
- * Read a response body as text, truncated to a character cap (error excerpts only).
- * @param response - the response to drain.
- * @param cap - the character cap.
- * @returns the decoded text, never longer than `cap` characters.
- */
-export async function readBoundedText(response: Response, cap: number): Promise<string> {
-  if (response.body === null) return ''
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let text = ''
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      text += decoder.decode(value, { stream: true })
-      if (text.length > cap) return text.slice(0, cap)
-    }
-    text += decoder.decode()
-  } finally {
-    reader.releaseLock()
-  }
-  return text.length > cap ? text.slice(0, cap) : text
-}
-
-/**
- * Load one image from a local absolute path, an http(s) URL, or a durable attachment reference
- * (the JSON an `[image attachment …]` note carries), enforcing the byte bound before any bytes
- * reach the vision model. Non-http(s) URL schemes are rejected.
- * @param ctx - registrant context; supplies the optional attachment service.
- * @param input - the model-supplied image reference.
- * @param signal - caller cancellation.
- * @param maxBytes - image byte bound.
- * @returns the loaded bytes and sniffed media type.
- */
-export async function loadImage(ctx: Context, input: string, signal: AbortSignal, maxBytes: number): Promise<LoadedImage> {
-  const trimmed = input.trim()
-  if (trimmed.length === 0) throw new Error('describe-image: image must be a non-empty path, URL, or attachment reference')
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) && !/^https?:\/\//i.test(trimmed)) {
-    throw new Error('describe-image: only http(s) URLs, local file paths, and attachment references are supported')
-  }
-  if (trimmed.startsWith('{')) {
-    const bytes = await readAttachment(ctx, trimmed, signal)
-    if (bytes.length > maxBytes) {
-      throw new Error(`describe-image: image is ${bytes.length} bytes, above the ${maxBytes}-byte bound`)
-    }
-    return toImage(bytes, trimmed.slice(0, 96))
-  }
-  if (/^https?:\/\//i.test(trimmed)) {
-    const response = await fetch(trimmed, { signal, redirect: 'error' })
-    if (!response.ok) {
-      throw new Error(`describe-image: image fetch returned HTTP ${response.status}`)
-    }
-    const declared = Number(response.headers.get('content-length'))
-    if (Number.isSafeInteger(declared) && declared > maxBytes) {
-      throw new Error(`describe-image: image is ${declared} bytes, above the ${maxBytes}-byte bound`)
-    }
-    const bytes = await readBoundedBody(response, maxBytes)
-    return toImage(bytes, trimmed)
-  }
-  // A bare attachment id — the `sha256:…` string text models tend to copy out of
-  // an `[image attachment …]` note instead of the whole JSON. Resolve it through
-  // the attach-route registry (the store's digest verification still runs).
-  const registered = attachmentRefById(trimmed)
-  if (registered !== undefined) {
-    const bytes = await readAttachment(ctx, JSON.stringify(registered), signal)
-    if (bytes.length > maxBytes) {
-      throw new Error(`describe-image: image is ${bytes.length} bytes, above the ${maxBytes}-byte bound`)
-    }
-    return toImage(bytes, trimmed)
-  }
-  const info = await stat(trimmed, { bigint: false })
-  if (!info.isFile()) throw new Error(`describe-image: image path is not a file: ${trimmed}`)
-  if (info.size > maxBytes) {
-    throw new Error(`describe-image: image is ${info.size} bytes, above the ${maxBytes}-byte bound`)
-  }
-  const bytes = await readFile(trimmed, { signal })
-  return toImage(bytes, trimmed)
-}
-
-/** Media types the attachment reference may declare. */
-const ATTACHMENT_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
-
-/**
- * Validate a model-supplied attachment reference and read its verified bytes.
- * @param ctx - registrant context carrying the optional attachment service.
- * @param raw - the raw JSON the model copied from an `[image attachment …]` note.
- * @param signal - caller cancellation.
- * @returns the verified stored bytes.
- */
-export async function readAttachment(ctx: Context, raw: string, signal: AbortSignal): Promise<Buffer> {
-  const attachments = ctx.get('attachments')
-  if (attachments === undefined) {
-    throw new Error('describe-image: no attachment service is mounted; pass a file path or URL instead')
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    throw new Error('describe-image: image is not a valid attachment reference; copy the exact JSON from the [image attachment …] note')
-  }
-  const candidate = parsed as {
-    attachmentId?: unknown
-    mediaType?: unknown
-    bytes?: unknown
-    width?: unknown
-    height?: unknown
-    name?: unknown
-  }
-  const { attachmentId, mediaType, bytes, width, height, name } = candidate
-  if (typeof attachmentId !== 'string' || attachmentId.length === 0
-    || typeof mediaType !== 'string' || !ATTACHMENT_MEDIA_TYPES.has(mediaType)
-    || !Number.isSafeInteger(bytes) || (bytes as number) <= 0
-    || !Number.isSafeInteger(width) || (width as number) <= 0
-    || !Number.isSafeInteger(height) || (height as number) <= 0
-    || (name !== undefined && typeof name !== 'string')) {
-    throw new Error('describe-image: image is not a valid attachment reference; copy the exact JSON from the [image attachment …] note')
-  }
-  try {
-    const stored = await attachments.readImage({
-      attachmentId: attachmentId as ImageAttachmentRef['attachmentId'],
-      mediaType: mediaType as ImageAttachmentRef['mediaType'],
-      bytes: bytes as number,
-      width: width as number,
-      height: height as number,
-      ...name === undefined ? {} : { name },
-    }, signal)
-    return Buffer.from(stored.data)
-  } catch (error) {
-    if ((error as { code?: unknown } | null)?.code === 'ATTACHMENT_NOT_FOUND') {
-      throw new Error(`describe-image: attachment ${JSON.stringify(attachmentId)} is no longer available`)
-    }
-    throw error
-  }
-}
-
-/** Sniff the media type and reject empty or unsupported inputs. */
-function toImage(bytes: Buffer, source: string): LoadedImage {
-  if (bytes.length === 0) throw new Error(`describe-image: image is empty: ${source}`)
-  const mimeType = sniffMimeType(bytes)
-  if (mimeType === undefined) {
-    throw new Error(`describe-image: unsupported image type (expected PNG, JPEG, GIF, or WebP): ${source}`)
-  }
-  return { bytes, mimeType }
-}
-
-/** Extract the single text answer from an OpenAI-compatible chat-completions payload. */
-function extractChatCompletionsContent(payload: unknown): string {
-  const root = payload as { choices?: unknown } | null
-  if (typeof root !== 'object' || root === null || !Array.isArray(root.choices) || root.choices.length === 0) {
-    throw new Error('describe-image: vision endpoint returned an unexpected response shape')
-  }
-  const content = (root.choices[0] as { message?: { content?: unknown } } | null)?.message?.content
-  if (typeof content !== 'string' || content.trim().length === 0) {
-    throw new Error('describe-image: vision endpoint returned no text content')
-  }
-  return content
-}
-
-/** Extract the text answer from an OpenAI Responses payload: every `output_text` part of assistant messages. */
-function extractResponsesContent(payload: unknown): string {
-  const root = payload as { output?: unknown } | null
-  if (typeof root !== 'object' || root === null || !Array.isArray(root.output)) {
-    throw new Error('describe-image: vision endpoint returned an unexpected response shape')
-  }
-  const parts: string[] = []
-  for (const item of root.output) {
-    const candidate = item as { type?: unknown; role?: unknown; content?: unknown } | null
-    if (typeof candidate !== 'object' || candidate === null) continue
-    if (candidate.type !== 'message' || candidate.role !== 'assistant' || !Array.isArray(candidate.content)) continue
-    for (const part of candidate.content) {
-      const block = part as { type?: unknown; text?: unknown } | null
-      if (typeof block !== 'object' || block === null) continue
-      if (block.type === 'output_text' && typeof block.text === 'string' && block.text.trim().length > 0) {
-        parts.push(block.text)
-      }
-    }
-  }
-  const text = parts.join('\n')
-  if (text.trim().length === 0) {
-    throw new Error('describe-image: vision endpoint returned no text content')
-  }
-  return text
-}
-
-/** Build the request the configured style sends: its path and JSON body. */
-function buildVisionRequest(spec: ResolvedConfig, prompt: string, image: LoadedImage): { path: string; body: string } {
-  const dataUrl = `data:${image.mimeType};base64,${image.bytes.toString('base64')}`
-  if (spec.apiStyle === 'responses') {
-    return {
-      path: `${spec.baseURL}/responses`,
-      body: JSON.stringify({
-        model: spec.model,
-        max_output_tokens: spec.maxOutputTokens,
-        input: [{
-          role: 'user',
-          content: [
-            { type: 'input_text', text: prompt },
-            { type: 'input_image', image_url: dataUrl },
-          ],
-        }],
-      }),
-    }
-  }
-  return {
-    path: `${spec.baseURL}/chat/completions`,
-    body: JSON.stringify({
-      model: spec.model,
-      max_tokens: spec.maxOutputTokens,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: dataUrl } },
-        ],
-      }],
-    }),
-  }
-}
-
-/** Call the configured vision endpoint and return its text answer. */
-async function callVision(spec: ResolvedConfig, apiKey: string, prompt: string, image: LoadedImage, signal: AbortSignal): Promise<string> {
-  const { path, body } = buildVisionRequest(spec, prompt, image)
-  const response = await fetch(path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-    body,
-    redirect: 'error',
-    signal: AbortSignal.any([signal, AbortSignal.timeout(spec.timeoutMs)]),
-  })
-  if (!response.ok) {
-    const excerpt = await readBoundedText(response, 200)
-    throw new Error(`describe-image: vision endpoint returned HTTP ${response.status}: ${excerpt}`)
-  }
-  const payloadBytes = await readBoundedBody(response, spec.maxOutputTokens * 8 + 64 * 1024)
-  let payload: unknown
-  try {
-    payload = JSON.parse(payloadBytes.toString('utf8'))
-  } catch {
-    throw new Error('describe-image: vision endpoint returned invalid JSON')
-  }
-  return spec.apiStyle === 'responses' ? extractResponsesContent(payload) : extractChatCompletionsContent(payload)
-}
+export {
+  API_STYLES,
+  Config,
+  DEFAULT_API_KEY_ENV,
+  DEFAULT_API_STYLE,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_INTERCEPT_IMAGE_SEND,
+  DEFAULT_PROMPT,
+  DEFAULT_RENDER_IMAGE_PREVIEW,
+  DEFAULT_TIMEOUT_MS,
+  DESCRIBE_IMAGE_SETTINGS_NAMESPACE,
+  THINKING_SUFFIXES,
+  resolveApiKey,
+  resolveConfig,
+  splitModelSuffix,
+} from './config-resolve.ts'
+export type { ApiStyle, ResolvedConfig, ThinkingMode } from './config-resolve.ts'
+export {
+  callVision,
+  createVisionCache,
+  DEFAULT_CACHE_MAX_ENTRIES,
+  DEFAULT_CACHE_TTL_MS,
+  extractChatCompletionsContent,
+  extractResponsesContent,
+  loadImage,
+  parseImageAttachmentRef,
+  readAttachment,
+  readBoundedBody,
+  readBoundedText,
+  semanticRequestKey,
+} from './vision-client.ts'
+export type { LoadedImage, VisionCache } from './vision-client.ts'
+export {
+  buildModelsUrl,
+  buildModelPingRequest,
+  extractModelIds,
+  handleModelProbe,
+  handleModelTest,
+  probeModels,
+  testModelConnection,
+  PROBE_MAX_BODY_BYTES,
+  PROBE_MAX_MODELS,
+  PROBE_MODEL_PLACEHOLDER,
+  PROBE_TIMEOUT_MS,
+} from './model-probe.ts'
+export type { ModelProbeOutcome, ModelTestOutcome, ProbeKeyResolver } from './model-probe.ts'
 
 const DESCRIPTION_HEAD =
-  'Inspect one image — a local absolute path, an http(s) URL, or the JSON of an image attachment '
-  + 'note — and return the text the user needs. Use when the user references an image file or URL, '
+  'Inspect one image — a local absolute path inside the session workspace, an http(s) URL, a complete `[image attachment ...]` note, '
+  + 'or a self-contained Markdown attachment reference — and return the text the user needs. Use when the user references an image file or URL, '
   + 'or when a task needs OCR, chart or diagram reading, screenshot or UI analysis, translation of '
   + 'image text, or photo understanding. '
   + 'Always pass an explicit `prompt` with a precise instruction — e.g. "transcribe all text", '
   + '"extract the table as CSV", "diagnose the UI layout problems", "translate the text into '
   + 'Chinese" — instead of leaving it to the default description: a targeted instruction produces '
   + 'a much more useful answer. '
+  + 'If your model accepts image input directly, never call this tool for an image that is already '
+  + 'visible to you in the conversation — analyze it with your own vision — and prefer a native '
+  + 'image-reading tool (when one is available to you) for local image files. Reserve this tool '
+  + 'for images you cannot see: http(s) URLs, `[image attachment …]` notes, or when your model '
+  + 'lacks image input entirely. '
 
-/** The describe_image call's validated arguments. */
+/** The describe_image call’s validated arguments. */
 export interface DescribeImageArgs {
   image: string
   prompt?: string
@@ -481,9 +121,10 @@ export function describeImageCallView(args: DescribeImageArgs): GenericCallView 
 
 /**
  * Register the `describe_image` tool on `ctx.tools`. The image never enters the conversation: the
- * tool returns only the vision model's text answer. The `describe-image` settings section layers
+ * tool returns only the vision model’s text answer. The `describe-image` settings section layers
  * over the composition entry and is re-resolved per call, so the Settings → 插件配置 card's changes
- * reach the very next invocation.
+ * reach the very next invocation. Repeat calls for the same image and prompt reuse a short-lived
+ * semantic cache so the endpoint is not called twice in quick succession.
  *
  * Family adaptation: the aggregate mounts this plugin without configuration, so endpoint/model
  * validation is lazy — an empty composition entry loads fine and the first call fails with a clear
@@ -491,7 +132,9 @@ export function describeImageCallView(args: DescribeImageArgs): GenericCallView 
  * @param ctx - registrant context carrying the tool registry.
  * @param config - deployment configuration.
  */
-export function apply(ctx: Context, config: Config = {}): void {
+export const apply = mountOnce('@linxin666/dsh-tool-describe-image', applyImpl)
+
+function applyImpl(ctx: Context, config: Config = {}): void {
   // The loader fills schema defaults before apply, so an unconfigured entry
   // still arrives with default fields set. Only a config that actually names
   // the endpoint/model is validated eagerly — the family aggregate mounts
@@ -506,28 +149,58 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     onChange: () => {},
     validate: (value) => {
-      if (value.baseURL !== undefined || value.model !== undefined) resolveConfig(value)
+      // The Host applies a batched edit op by op, so each intermediate state
+      // is judged too: a connection is only validated once both halves
+      // exist, otherwise baseURL alone (model not landed yet) or model alone
+      // would each refuse the other's op and strand the save. A partial
+      // config still fails loud at the first describe_image call.
+      if (value.baseURL !== undefined && value.model !== undefined) resolveConfig(value)
     },
   })
   const spec = (): ResolvedConfig => resolveConfig(current())
+  // Short-lived semantic cache scoped to this mount: identical image + prompt
+  // within the TTL reuse the prior answer instead of a second fetch.
+  const visionCache = createVisionCache()
   // The webserver is optional (the loader-composition tests boot without one):
-  // the attach route registers only when the service is actually mounted.
-  registerAttachRoute(ctx, () => current().maxBytes ?? DEFAULT_MAX_BYTES)
+  // the attach route registers only when the service is actually mounted. The
+  // capability probe lets the browser send hook pass raw image blocks to
+  // models whose adapter declares image input, instead of rewriting every
+  // image-bearing send into describe-image references. The route resolver is
+  // shared with the tool-visibility controller so both seams always agree on
+  // one session's verdict: multimodal sessions get the raw blocks and never
+  // see describe_image in their toolset, text-only sessions get the rewrite
+  // and the tool.
+  const routeResolver = createRouteResolver(ctx)
+  const probe = createCapabilityProbe(ctx, routeResolver)
+  installToolVisibility(ctx, routeResolver)
+  registerAttachRoute(ctx, () => current().maxBytes ?? DEFAULT_MAX_BYTES, probe)
+  // rc.8 native-image requests: report the default route's image-input state
+  // and toggle the llm-deepseek catalog entry for the current model. Exact
+  // routes win over the /describe-image prefix table, so the capability and
+  // attach handlers keep their paths.
+  const webserver = ctx.get('webServer')
+  if (webserver !== undefined) {
+    for (const route of registerNativeImageRoutes(ctx, routeResolver)) webserver.register(route)
+  }
+  // The settings card's probe button: list the endpoint's models per request,
+  // honoring unsaved drafts so the user can verify a new endpoint before
+  // saving; the key resolves through the same seam a vision call uses.
+  registerModelRoutes(ctx, () => current(), (spec) => resolveApiKey(ctx, spec))
   ctx.tools.register(defineTool({
     name: 'describe_image',
     description: DESCRIPTION_HEAD
-      + 'The image may be a local path, an http(s) URL, the JSON object from an `[image attachment …]` '
-      + "note, or — the common case when the user used this plugin's input-box image button — a "
-      + 'short markdown image reference like `![图片](/describe-image/raw/sha256:abc…)` pasted into '
-      + 'the conversation. In the markdown form, take the attachment id from the URL and pass that id '
-      + 'as the `image` value (never the whole markdown, and never a made-up path); the tool resolves '
-      + 'the id to the stored image. The image itself never enters the conversation — only the '
-      + 'returned text is shown to you.',
+      + 'The image may be a local path, an http(s) URL, a complete `[image attachment ...]` note, or — '
+      + "the common case when the user used this plugin's input-box image button — the complete Markdown "
+      + 'image reference like `![图片](/describe-image/raw/sha256:abc?ref=...)` pasted into the conversation. '
+      + 'Pass that complete Markdown reference as the `image` value: it carries the durable attachment '
+      + 'metadata needed after a host restart or inside a PTC nested tool call. A bare attachment id stays '
+      + 'supported only while this host process has seen the upload. The image itself never enters the '
+      + 'conversation — only the returned text is shown to you.',
     parameters: {
       image: {
         type: 'string',
         required: true,
-        description: 'Absolute path to a local image file, an http(s) URL of the image, the JSON object from an [image attachment …] note, or the bare attachment id (e.g. sha256:abc…) taken from the markdown image reference ![图片](/describe-image/raw/<id>) that the plugin\'s input-box image button pasted into the conversation.',
+        description: 'Absolute local image path inside the session workspace, http(s) URL, complete [image attachment ...] note, or complete Markdown reference ![图片](/describe-image/raw/<id>?ref=...) from the input box. The complete Markdown reference is durable across host restarts and PTC nested tool calls; a bare attachment id is only a current-process fallback.',
       },
       prompt: {
         type: 'string',
@@ -551,8 +224,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     async execute(args, exec) {
       const active = spec()
       const apiKey = await resolveApiKey(ctx, active)
-      const image = await loadImage(ctx, args.image, exec.signal, active.maxBytes)
-      const text = await callVision(active, apiKey, args.prompt ?? active.defaultPrompt, image, exec.signal)
+      // Local file paths are bounded to the session workspace (exec.agent), so a
+      // prompt-injected path cannot read arbitrary host files; URL hosts are
+      // bounded by the URL guard inside loadImage.
+      const image = await loadImage(ctx, args.image, exec.signal, active.maxBytes, exec.agent?.session.header.cwd)
+      const text = await callVision(active, apiKey, args.prompt ?? active.defaultPrompt, image, exec.signal, visionCache)
       return { text, model: active.model, image: args.image, mimeType: image.mimeType, bytes: image.bytes.length }
     },
     presentCall: describeImageCallView,

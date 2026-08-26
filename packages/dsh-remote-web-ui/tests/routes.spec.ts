@@ -58,11 +58,14 @@ async function call(
   port: number,
   method: 'GET' | 'POST',
   path: string,
-  opts: { host?: string; body?: unknown; cookie?: string } = {},
-): Promise<{ status: number; body: Record<string, unknown>; cookies: string[] }> {
+  opts: { host?: string; body?: unknown; cookie?: string; headers?: Record<string, string> } = {},
+): Promise<{ status: number; body: Record<string, unknown>; cookies: string[]; referrerPolicy: string | undefined }> {
   return await new Promise((resolve, reject) => {
     const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body)
     const headers: Record<string, string> = { host: opts.host ?? `127.0.0.1:${String(port)}` }
+    for (const [name, value] of Object.entries(opts.headers ?? {})) {
+      if (name.toLowerCase() !== 'host') headers[name] = value
+    }
     if (payload !== undefined) headers['content-type'] = 'application/json'
     if (opts.cookie !== undefined) headers.cookie = opts.cookie
     const req = httpRequest(
@@ -75,12 +78,47 @@ async function call(
           const raw = Buffer.concat(chunks).toString('utf8')
           let body: Record<string, unknown> = {}
           try { body = JSON.parse(raw) as Record<string, unknown> } catch { /* empty body */ }
-          resolve({ status: response.statusCode ?? 0, body, cookies: setCookie })
+          resolve({
+            status: response.statusCode ?? 0,
+            body,
+            cookies: setCookie,
+            referrerPolicy: response.headers['referrer-policy'],
+          })
         })
       },
     )
     req.on('error', reject)
     if (payload !== undefined) req.write(payload)
+    req.end()
+  })
+}
+
+/** Read the first SSE `data:` frame then abort the stream. */
+async function readFirstSse(port: number, path: string): Promise<Record<string, unknown>> {
+  return await new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { host: '127.0.0.1', port, path, method: 'GET', headers: { host: `127.0.0.1:${String(port)}` } },
+      (response) => {
+        let buf = ''
+        response.on('data', (chunk) => {
+          buf += String(chunk)
+          const match = /data: (.+)\n\n/.exec(buf)
+          if (match?.[1] === undefined) return
+          try {
+            const parsed = JSON.parse(match[1]) as Record<string, unknown>
+            req.destroy()
+            resolve(parsed)
+          } catch (error) {
+            req.destroy()
+            reject(error)
+          }
+        })
+      },
+    )
+    req.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'ECONNRESET' || error.message.includes('aborted')) return
+      reject(error)
+    })
     req.end()
   })
 }
@@ -96,12 +134,16 @@ describe('/api/pair routes', () => {
       // Loopback issues; the URL embeds the token and workspace target.
       const issued = await call(port, 'POST', '/api/pair/issue', { body: { workspaceId: 'ws-7' } })
       expect(issued.status).toBe(200)
-      expect(issued.body.url).toMatch(/^http:\/\/192\.168\.1\.5:3080\/\?pair=tok-1&workspace=ws-7$/)
+      expect(issued.body.url).toMatch(/^http:\/\/192\.168\.1\.5:3080\/m\/\?pair=tok-1&workspace=ws-7$/)
       expect(issued.body.lanAddresses).toEqual(['192.168.1.5'])
       // A LAN phone accepts: sets the HttpOnly device cookie.
       const accepted = await call(port, 'POST', '/api/pair/accept', { host: '192.168.1.5:3080', body: { token: 'tok-1' } })
       expect(accepted.status).toBe(200)
-      expect(accepted.cookies[0]).toMatch(/^dsh_pair=tok-1; Path=\/; HttpOnly; SameSite=Lax/)
+      expect(accepted.body).toEqual({ ok: true, deviceId: 'tok-1' })
+      expect(accepted.referrerPolicy).toBe('no-referrer')
+      expect(accepted.cookies).toEqual([
+        'dsh_pair=tok-1; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000',
+      ])
       // The same token is one-time: reuse is refused.
       const reused = await call(port, 'POST', '/api/pair/accept', { host: '192.168.1.5:3080', body: { token: 'tok-1' } })
       expect(reused.status).toBe(409)
@@ -139,7 +181,7 @@ describe('/api/pair routes', () => {
     try {
       const chosen = await call(port, 'POST', '/api/pair/issue', { body: { address: '10.0.0.3' } })
       expect(chosen.status).toBe(200)
-      expect(chosen.body.url).toMatch(/^http:\/\/10\.0\.0\.3:3080\/\?pair=tok-1$/)
+      expect(chosen.body.url).toMatch(/^http:\/\/10\.0\.0\.3:3080\/m\/\?pair=tok-1$/)
       expect(chosen.body.lanAddresses).toEqual(['192.168.1.5', '10.0.0.3'])
       const unknown = await call(port, 'POST', '/api/pair/issue', { body: { address: '192.0.2.1' } })
       expect(unknown.status).toBe(400)
@@ -190,12 +232,12 @@ describe('/api/pair routes', () => {
       // Loopback issues; the default URL is now built from the public base.
       const issued = await call(port, 'POST', '/api/pair/issue', {})
       expect(issued.status).toBe(200)
-      expect(issued.body.url).toMatch(/^https:\/\/phone\.example\.com\/\?pair=tok-1$/)
+      expect(issued.body.url).toMatch(/^https:\/\/phone\.example\.com\/m\/\?pair=tok-1$/)
       expect(issued.body.publicBaseUrl).toBe('https://phone.example.com')
       expect(issued.body.lanAddresses).toEqual(['192.168.1.5'])
       // An explicit LAN address still mints a LAN URL (in-network fallback).
       const lan = await call(port, 'POST', '/api/pair/issue', { body: { address: '192.168.1.5' } })
-      expect(lan.body.url).toMatch(/^http:\/\/192\.168\.1\.5:3080\/\?pair=tok-1$/)
+      expect(lan.body.url).toMatch(/^http:\/\/192\.168\.1\.5:3080\/m\/\?pair=tok-1$/)
       // The tunneled host passes the phone-facing fence: accept + status work.
       const accepted = await call(port, 'POST', '/api/pair/accept', { host: 'phone.example.com', body: { token: 'tok-1' } })
       expect(accepted.status).toBe(200)
@@ -222,12 +264,93 @@ describe('/api/pair routes', () => {
     try {
       const issued = await call(port, 'POST', '/api/pair/issue', {})
       expect(issued.status).toBe(200)
-      expect(issued.body.url).toMatch(/^https:\/\/phone\.example\.com:8443\/\?pair=tok-1$/)
+      expect(issued.body.url).toMatch(/^https:\/\/phone\.example\.com:8443\/m\/\?pair=tok-1$/)
       // The fence matches the authority verbatim, port included.
       const accepted = await call(port, 'POST', '/api/pair/accept', { host: 'phone.example.com:8443', body: { token: 'tok-1' } })
       expect(accepted.status).toBe(200)
       const wrongPort = await call(port, 'POST', '/api/pair/heartbeat', { host: 'phone.example.com:9999', cookie: 'dsh_pair=tok-1' })
       expect(wrongPort.status).toBe(403)
+    } finally {
+      await close()
+    }
+  })
+
+  it('publishes the live desktop gate policy without exposing sensitive state', async () => {
+    const service = makeService()
+    let requirePairingForLan = false
+    const { port, close } = await serve(makeRoutes({
+      service,
+      lanAddresses: ['192.168.1.5'],
+      requirePairingForLan: () => requirePairingForLan,
+    }))
+    try {
+      const disabled = await call(port, 'GET', '/api/pair/status', { host: '192.168.1.5:3080' })
+      expect(disabled.body).toMatchObject({ ok: true, paired: false, requirePairingForLan: false })
+      requirePairingForLan = true
+      const enabled = await call(port, 'GET', '/api/pair/status', { host: '192.168.1.5:3080' })
+      expect(enabled.body).toMatchObject({ ok: true, paired: false, requirePairingForLan: true })
+      expect(enabled.body).not.toHaveProperty('deviceCount')
+    } finally {
+      await close()
+    }
+  })
+
+  it('redacts the pairing oracle fields from unpaired status callers', async () => {
+    const service = makeService()
+    service.setPublicBaseUrl('https://phone.example.com')
+    service.setTunnelStatus({ state: 'running', url: 'https://xyz.trycloudflare.com' })
+    service.issue('ws-7', undefined)
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      // No cookie: only pairing-relevant fields, no token/device/tunnel oracle.
+      const unpaired = await call(port, 'GET', '/api/pair/status', { host: '192.168.1.5:3080' })
+      expect(unpaired.status).toBe(200)
+      expect(unpaired.body).toMatchObject({ ok: true, paired: false, requirePairingForLan: true, phase: 'waiting', lanAvailable: true })
+      expect(unpaired.body).not.toHaveProperty('tokenId')
+      expect(unpaired.body).not.toHaveProperty('tokenExpiresAt')
+      expect(unpaired.body).not.toHaveProperty('deviceCount')
+      expect(unpaired.body).not.toHaveProperty('onlineCount')
+      expect(unpaired.body).not.toHaveProperty('publicUrl')
+      expect(unpaired.body).not.toHaveProperty('tunnel')
+      // A live device cookie sees the full snapshot.
+      await call(port, 'POST', '/api/pair/accept', { host: '192.168.1.5:3080', body: { token: 'tok-1' } })
+      const paired = await call(port, 'GET', '/api/pair/status', { host: '192.168.1.5:3080', cookie: 'dsh_pair=tok-1' })
+      expect(paired.body).toMatchObject({ ok: true, paired: true, phase: 'connected' })
+      expect(paired.body).toHaveProperty('deviceCount')
+      expect(paired.body).toHaveProperty('onlineCount')
+      expect(paired.body).toHaveProperty('tokenExpiresAt')
+    } finally {
+      await close()
+    }
+  })
+
+  it('partitions the accept rate-limit buckets by the client-visible XFF hop', async () => {
+    const service = makeService()
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      // Distinct XFF clients each get their own bucket: none trips the limit.
+      for (let index = 0; index < 12; index += 1) {
+        const attempt = await call(port, 'POST', '/api/pair/accept', {
+          host: '192.168.1.5:3080',
+          body: { token: 'nope' },
+          headers: { 'x-forwarded-for': '203.0.113.' + String(index) },
+        })
+        expect(attempt.status).not.toBe(429)
+      }
+      // One client exhausting its bucket is rate-limited from attempt 12 on.
+      for (let index = 0; index < 11; index += 1) {
+        await call(port, 'POST', '/api/pair/accept', {
+          host: '192.168.1.5:3080',
+          body: { token: 'nope' },
+          headers: { 'x-forwarded-for': '198.51.100.7' },
+        })
+      }
+      const limited = await call(port, 'POST', '/api/pair/accept', {
+        host: '192.168.1.5:3080',
+        body: { token: 'nope' },
+        headers: { 'x-forwarded-for': '198.51.100.7' },
+      })
+      expect(limited.status).toBe(429)
     } finally {
       await close()
     }
@@ -239,6 +362,141 @@ describe('/api/pair routes', () => {
     try {
       const status = await call(port, 'GET', '/api/pair/issue', {})
       expect(status.status).toBe(405)
+    } finally {
+      await close()
+    }
+  })
+
+  it('malformed payloads are refused with the existing error shape', async () => {
+    const service = makeService()
+    service.setLanBases([{ address: '192.168.1.5', base: 'http://192.168.1.5:3080' }])
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      const badIssue = await call(port, 'POST', '/api/pair/issue', { body: { address: 42 } })
+      expect(badIssue.status).toBe(400)
+      expect(badIssue.body).toEqual({ ok: false, code: 'bad-payload' })
+      const badAccept = await call(port, 'POST', '/api/pair/accept', { host: '192.168.1.5:3080', body: { token: 7 } })
+      expect(badAccept.status).toBe(400)
+      expect(badAccept.body).toEqual({ ok: false, code: 'bad-payload' })
+    } finally {
+      await close()
+    }
+  })
+
+  it('omits the device roster from status even for a paired cookie', async () => {
+    const service = makeService()
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      await call(port, 'POST', '/api/pair/issue', {})
+      await call(port, 'POST', '/api/pair/accept', {
+        host: '192.168.1.5:3080',
+        body: { token: 'tok-1' },
+        headers: { 'user-agent': 'Mozilla/5.0 TestPhone' },
+      })
+      const status = await call(port, 'GET', '/api/pair/status', { host: '192.168.1.5:3080', cookie: 'dsh_pair=tok-1' })
+      expect(status.body).toMatchObject({ ok: true, paired: true, deviceCount: 1 })
+      expect(status.body).not.toHaveProperty('devices')
+    } finally {
+      await close()
+    }
+  })
+
+  it('pushes the device roster on the loopback events stream', async () => {
+    const service = makeService()
+    service.issue()
+    service.accept('tok-1', 'Mozilla/5.0 TestPhone')
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      const frame = await readFirstSse(port, '/api/pair/events')
+      expect(frame.type).toBe('state')
+      expect(frame.devices).toEqual([
+        expect.objectContaining({ id: 'tok-1', online: true, userAgent: 'Mozilla/5.0 TestPhone' }),
+      ])
+    } finally {
+      await close()
+    }
+  })
+
+  it('revokes one device from loopback and refuses LAN revoke', async () => {
+    const service = makeService()
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      await call(port, 'POST', '/api/pair/issue', {})
+      await call(port, 'POST', '/api/pair/accept', { host: '192.168.1.5:3080', body: { token: 'tok-1' } })
+      const lanRevoke = await call(port, 'POST', '/api/pair/revoke', {
+        host: '192.168.1.5:3080',
+        body: { deviceId: 'tok-1' },
+      })
+      expect(lanRevoke.status).toBe(403)
+      expect(service.hasDevice('tok-1')).toBe(true)
+      const revoked = await call(port, 'POST', '/api/pair/revoke', { body: { deviceId: 'tok-1' } })
+      expect(revoked.status).toBe(200)
+      expect(service.hasDevice('tok-1')).toBe(false)
+      const missing = await call(port, 'POST', '/api/pair/revoke', { body: { deviceId: 'tok-1' } })
+      expect(missing.status).toBe(404)
+    } finally {
+      await close()
+    }
+  })
+})
+describe('/api/pair body failure contract (shared readJsonBody)', () => {
+  /** Raw POST with no JSON encoding: malformed text, or no payload at all. */
+  async function rawPost(
+    port: number,
+    path: string,
+    payload: string | undefined,
+  ): Promise<{ status: number | null; body: string; error: string | null }> {
+    return await new Promise((resolve) => {
+      const headers: Record<string, string> = { host: '127.0.0.1:' + String(port), connection: 'close' }
+      if (payload !== undefined) {
+        headers['content-type'] = 'application/json'
+        headers['content-length'] = String(Buffer.byteLength(payload))
+      }
+      const req = httpRequest({ host: '127.0.0.1', port, path, method: 'POST', headers }, (response) => {
+        const chunks: Buffer[] = []
+        response.on('data', (chunk) => { chunks.push(chunk as Buffer) })
+        response.on('end', () => {
+          resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8'), error: null })
+        })
+      })
+      req.on('error', (error: Error) => resolve({ status: null, body: '', error: error.message }))
+      if (payload !== undefined) req.write(payload)
+      req.end()
+    })
+  }
+
+  it('locks the lenient absent-body contract: empty or unparseable bodies act as an empty object', async () => {
+    const service = makeService()
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      // stopPair() and sendHeartbeat() post with no body at all.
+      const stop = await call(port, 'POST', '/api/pair/stop', {})
+      expect(stop.status).toBe(200)
+      expect(stop.body).toEqual({ ok: true })
+      const heartbeat = await call(port, 'POST', '/api/pair/heartbeat', {})
+      expect(heartbeat.status).toBe(401)
+      // An unparseable body is treated the same as an absent one.
+      const issue = await rawPost(port, '/api/pair/issue', '{not json')
+      expect(issue.status).toBe(200)
+      expect(issue.body).toContain('"token":"tok-1"')
+      const revoke = await rawPost(port, '/api/pair/revoke', '{not json')
+      expect(revoke.status).toBe(400)
+      expect(JSON.parse(revoke.body)).toEqual({ ok: false, code: 'bad-payload' })
+      // objectOnly: a JSON array is read as null and therefore absent.
+      const array = await call(port, 'POST', '/api/pair/issue', { body: [1, 2] })
+      expect(array.status).toBe(200)
+    } finally {
+      await close()
+    }
+  })
+
+  it('locks the oversize contract: the shared reader destroys the request instead of answering', async () => {
+    const service = makeService()
+    const { port, close } = await serve(makeRoutes({ service, lanAddresses: ['192.168.1.5'] }))
+    try {
+      const outcome = await rawPost(port, '/api/pair/issue', JSON.stringify({ workspaceId: 'x'.repeat(5000) }))
+      expect(outcome.status).toBeNull()
+      expect(outcome.error).toMatch(/socket hang up|ECONNRESET/)
     } finally {
       await close()
     }

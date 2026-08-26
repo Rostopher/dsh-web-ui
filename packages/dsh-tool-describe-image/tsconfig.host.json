@@ -25,8 +25,19 @@
   },
   "include": [
     "src/index.ts",
+    "src/mount-once.ts",
     "src/invariant.ts",
     "src/media.ts",
-    "src/attach-routes.ts"
+    "src/attachment-reference.ts",
+    "src/attach-routes.ts",
+    "src/model-capability.ts",
+    "src/model-probe.ts",
+    "src/loopback.ts",
+    "src/url-guard.ts",
+    "src/tool-visibility.ts",
+    "src/native-images.ts",
+    "src/config-resolve.ts",
+    "src/http.ts",
+    "src/vision-client.ts"
   ]
 }

@@ -10,8 +10,10 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
+import { z, type ZodType } from 'zod'
 import { UnknownLanAddressError, type PairingService, type PairingSnapshot } from './pairing.ts'
 import { isLoopbackClient, readCookie } from './gate.ts'
+import { readJsonBody, writeJson } from './http.ts'
 
 /**
  * Browser-trust fence for the /api/pair routes, mirroring the connection
@@ -86,34 +88,42 @@ export const PAIR_PATHS = {
   issue: '/api/pair/issue',
   accept: '/api/pair/accept',
   stop: '/api/pair/stop',
+  revoke: '/api/pair/revoke',
   heartbeat: '/api/pair/heartbeat',
   status: '/api/pair/status',
   events: '/api/pair/events',
 } as const
 
-/** One JSON response. */
-function writeJson(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body)
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'referrer-policy': 'no-referrer' })
-  res.end(payload)
-}
+/**
+ * /api/pair request payload contracts. Each POST endpoint validates its body
+ * against one of these instead of reaching into a hand-parsed object: the
+ * control-plane endpoints that carry no meaningful payload use the permissive
+ * pairActionPayloadSchema so their smoke calls keep working unchanged, while
+ * issue/accept enforce their optional/required fields. Unknown (extra) keys
+ * are tolerated exactly as the previous manual reads ignored them.
+ */
+export const issuePayloadSchema = z.object({
+  workspaceId: z.string().min(1).optional(),
+  address: z.string().min(1).optional(),
+})
+export const acceptPayloadSchema = z.object({
+  token: z.string().default(''),
+})
+export const revokePayloadSchema = z.object({
+  deviceId: z.string().min(1),
+})
+export const pairActionPayloadSchema = z.object({}).passthrough()
 
-/** Read a request body up to MAX_BODY_BYTES and parse it as JSON. */
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer
-    size += buffer.length
-    if (size > MAX_BODY_BYTES) return undefined
-    chunks.push(buffer)
-  }
-  try {
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-    return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
-  } catch {
-    return undefined
-  }
+/**
+ * Parse a pair request body through schema. A missing/empty, unparseable
+ * or non-object body (shared readJsonBody with objectOnly yields null for
+ * all of them) is treated as an empty object — the desktop stop/heartbeat
+ * send no body — and a value that fails the schema returns `undefined` so
+ * the caller can answer with the existing error shape.
+ */
+function parsePairPayload<T>(schema: ZodType<T>, body: unknown | null): T | undefined {
+  const result = schema.safeParse(body ?? {})
+  return result.success ? result.data : undefined
 }
 
 /** One open desktop status stream. */
@@ -176,6 +186,8 @@ export interface PairRoutesDeps {
   service: PairingService
   /** The LAN IP literals the fence accepts (derived from the bind host). */
   lanAddresses: readonly string[]
+  /** Current desktop gate policy, re-read for every status response. */
+  requirePairingForLan?: boolean | (() => boolean)
 }
 
 /**
@@ -184,7 +196,10 @@ export interface PairRoutesDeps {
  * @returns the exact routes to register on webServer.
  */
 export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
-  const { service, lanAddresses } = deps
+  const { service, lanAddresses, requirePairingForLan = true } = deps
+  const pairingRequired = (): boolean => typeof requirePairingForLan === 'function'
+    ? requirePairingForLan()
+    : requirePairingForLan
   const events = new PairingEventsStream(service)
 
   /** Loopback-only fence: the desktop panel's control endpoints. */
@@ -207,8 +222,25 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
   const ACCEPT_MAX_ATTEMPTS = 10
   const ACCEPT_WINDOW_MS = 30_000
   const rateLimitAccept = (req: IncomingMessage): boolean => {
-    const ip = (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress ?? 'unknown'
+    const socketIp = (req.socket as { remoteAddress?: string } | undefined)?.remoteAddress ?? 'unknown'
+    // Behind the auto-tunnel every internet client arrives from 127.0.0.1,
+    // so a single shared bucket would let one attacker keep the legitimate
+    // owner rate-limited. Partition the availability bucket by the first
+    // client-visible XFF hop (set by the tunnel edge): XFF is untrusted for
+    // authentication and only separates buckets, it never grants access.
+    const forwarded = typeof req.headers['x-forwarded-for'] === 'string'
+      ? (req.headers['x-forwarded-for'].split(',')[0] ?? '').trim()
+      : undefined
+    const ip = forwarded === undefined || forwarded === '' ? socketIp : socketIp + '|' + forwarded
     const nowMs = Date.now()
+    // The map lives as long as the plugin: prune expired windows once the
+    // table grows past a modest size so distinct source IPs (LAN clients,
+    // brute-force scans) cannot accumulate forever.
+    if (acceptAttempts.size > 256) {
+      for (const [key, attempt] of acceptAttempts) {
+        if (nowMs - attempt.windowStart > ACCEPT_WINDOW_MS) acceptAttempts.delete(key)
+      }
+    }
     const entry = acceptAttempts.get(ip)
     if (entry === undefined || nowMs - entry.windowStart > ACCEPT_WINDOW_MS) {
       acceptAttempts.set(ip, { count: 1, windowStart: nowMs })
@@ -224,13 +256,13 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       writeJson(res, 403, { ok: false, code: 'forbidden' })
       return
     }
-    const body = await readJsonBody(req)
-    const workspaceId = body === undefined || typeof body.workspaceId !== 'string' || body.workspaceId === ''
-      ? undefined
-      : body.workspaceId
-    const address = body === undefined || typeof body.address !== 'string' || body.address === ''
-      ? undefined
-      : body.address
+    const body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES, objectOnly: true })
+    const payload = parsePairPayload(issuePayloadSchema, body)
+    if (payload === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
+    const { workspaceId, address } = payload
     try {
       const { token, expiresAt } = service.issue(workspaceId, address)
       // The default base is the public (tunneled) URL when configured — a
@@ -241,7 +273,7 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       const workspaceQuery = workspaceId === undefined ? '' : `&workspace=${encodeURIComponent(workspaceId)}`
       writeJson(res, 200, {
         ok: true,
-        url: `${base}/?pair=${token}${workspaceQuery}`,
+        url: `${base}/m/?pair=${token}${workspaceQuery}`,
         token,
         expiresAt,
         // Every constructible base, so a multi-homed panel can switch the
@@ -272,20 +304,26 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       writeJson(res, 429, { ok: false, code: 'rate-limited' })
       return
     }
-    const body = await readJsonBody(req)
-    const token = typeof body?.token === 'string' ? body.token : ''
-    const result = service.accept(token)
+    const body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES, objectOnly: true })
+    const payload = parsePairPayload(acceptPayloadSchema, body)
+    if (payload === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
+    const ua = req.headers['user-agent']
+    const result = service.accept(payload.token, typeof ua === 'string' ? ua : undefined)
     if (!result.ok) {
       writeJson(res, result.code === 'used' ? 409 : 404, { ok: false, code: result.code })
       return
     }
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
+    // No Secure attribute: LAN pairing runs over plain HTTP (the cookie must
+    // work there), and the same cookie rides HTTPS on the tunnel. Lax keeps
+    // top-level navigations working while blocking cross-site subrequests.
+    writeJson(res, 200, { ok: true, deviceId: result.deviceId }, {
       'set-cookie': [
         `${service.config.cookieName}=${result.deviceId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${String(COOKIE_MAX_AGE_SEC)}`,
       ],
     })
-    res.end(JSON.stringify({ ok: true, deviceId: result.deviceId }))
   }
 
   const handleStop = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -294,8 +332,32 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       writeJson(res, 403, { ok: false, code: 'forbidden' })
       return
     }
-    await readJsonBody(req)
+    const body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES, objectOnly: true })
+    if (parsePairPayload(pairActionPayloadSchema, body) === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
     service.stop()
+    writeJson(res, 200, { ok: true })
+  }
+
+  const handleRevoke = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (!requireMethod(req, res, 'POST')) return
+    if (!loopbackFence(req)) {
+      writeJson(res, 403, { ok: false, code: 'forbidden' })
+      return
+    }
+    const body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES, objectOnly: true })
+    const payload = parsePairPayload(revokePayloadSchema, body)
+    if (payload === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
+    const revoked = service.revoke(payload.deviceId)
+    if (!revoked) {
+      writeJson(res, 404, { ok: false, code: 'unknown-device' })
+      return
+    }
     writeJson(res, 200, { ok: true })
   }
 
@@ -305,7 +367,11 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       writeJson(res, 403, { ok: false, code: 'forbidden' })
       return
     }
-    await readJsonBody(req)
+    const body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES, objectOnly: true })
+    if (parsePairPayload(pairActionPayloadSchema, body) === undefined) {
+      writeJson(res, 400, { ok: false, code: 'bad-payload' })
+      return
+    }
     const deviceId = readCookie(req.headers.cookie, service.config.cookieName)
     if (deviceId === undefined || !service.heartbeat(deviceId)) {
       writeJson(res, 401, { ok: false, code: 'unpaired' })
@@ -321,7 +387,18 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
       return
     }
     const deviceId = readCookie(req.headers.cookie, service.config.cookieName)
-    writeJson(res, 200, { ok: true, paired: deviceId !== undefined && service.hasDevice(deviceId), ...service.snapshot() })
+    const paired = deviceId !== undefined && service.hasDevice(deviceId)
+    const snapshot = service.snapshot()
+    // Unpaired LAN/tunnel clients get only the pairing-relevant fields; the
+    // token expiry, public tunnel URL, and counts are an oracle for targeting
+    // and stay behind a live device cookie. The per-device roster (ids are
+    // session credentials) is never returned here — only the loopback events
+    // stream carries it to the desktop panel.
+    const { devices: _devices, ...rest } = snapshot
+    const visible = paired
+      ? rest
+      : { phase: snapshot.phase, lanAvailable: snapshot.lanAvailable, lanAddresses: snapshot.lanAddresses }
+    writeJson(res, 200, { ok: true, paired, requirePairingForLan: pairingRequired(), ...visible })
   }
 
   const handleEvents = (req: IncomingMessage, res: ServerResponse): void => {
@@ -339,6 +416,7 @@ export function makeRoutes(deps: PairRoutesDeps): WebRoute[] {
     { kind: 'exact', path: PAIR_PATHS.issue, handler: handleIssue },
     { kind: 'exact', path: PAIR_PATHS.accept, handler: handleAccept },
     { kind: 'exact', path: PAIR_PATHS.stop, handler: handleStop },
+    { kind: 'exact', path: PAIR_PATHS.revoke, handler: handleRevoke },
     { kind: 'exact', path: PAIR_PATHS.heartbeat, handler: handleHeartbeat },
     { kind: 'exact', path: PAIR_PATHS.status, handler: handleStatus },
     { kind: 'exact', path: PAIR_PATHS.events, handler: handleEvents },

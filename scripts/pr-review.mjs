@@ -2,7 +2,7 @@
 /**
  * pr-review - 本地批量审核远程 PR 的 CLI 工具。
  *
- * 针对 dsh-web-ui（及同类仓库）的外部 PR 审核：硬性规则 + worktree 构建验证。
+ * 针对 dsh-web（及同类仓库）的外部 PR 审核：硬性规则 + worktree 构建验证。
  * 规则来源：PR 模板（.github/pull_request_template.md）、AGENTS.md、ci.yml、
  * pr-contribution-rules.yml。规则与仓库文档冲突时以文档为准。
  *
@@ -75,6 +75,19 @@ export const EMOJI_GLOBAL_RE = new RegExp(EMOJI_RE.source, 'gu')
 
 /** Conventional Commits（仓库允许的 type 集合）。 */
 export const CONVENTIONAL_COMMIT_RE = /^(feat|fix|chore|docs|test|refactor|perf)(\([^)]+\))?!?: .+/
+
+/** 已知纯文本模型（不支持图像输入）：视觉修复类 PR 禁用。 */
+export const TEXT_ONLY_MODEL_RES = [
+  /^deepseek$/i,
+  /deepseek[-_ ]?(chat|reasoner|r1|v3|v2|v1)/i,
+  /gpt[-_ ]?3(\.5)?([-_ ]turbo)?/i,
+  /llama[-_ ]?(2|3)/i,
+  /glm[-_ ]?(3|4)/i,
+  /moonshot|kimi/i,
+  /doubao|\u8c46\u5305/i,
+  /ernie|\u6587\u5fc3/i,
+  /mistral/i,
+]
 
 /** 新增二进制文件白名单（对齐 ci.yml emoji 检查的 skip_suffixes + 常见文档）。 */
 export const ALLOWED_BINARY_EXT = new Set([
@@ -232,17 +245,17 @@ export function addedLinesFromDiff(text) {
     } else if (line.startsWith(`+`) && !line.startsWith(`+++`)) {
       newLine += 1
       out.push({ path: file, line: newLine, text: line.slice(1) })
-    } else if (!line.startsWith(`-`)) {
+    } else if (!line.startsWith(`-`) && !line.startsWith(`\\`)) {
       newLine += 1
     }
   }
   return out
 }
 
-/** 密钥扫描：命中新增行即拒绝；测试目录内的命中降级为警告（防 fixture 误拒）。 */
-export function checkSecrets(diffText) {
+/** 密钥扫描：命中新增行即拒绝；测试目录内的命中降级为警告（防 fixture 误拒）。调用方可传入预解析的新增行避免重复解析 diff。 */
+export function checkSecrets(diffText, addedLines) {
   const findings = []
-  for (const { path, line, text } of addedLinesFromDiff(diffText)) {
+  for (const { path, line, text } of addedLines ?? addedLinesFromDiff(diffText)) {
     const isTest = TEST_PATH_RE.test(path)
     for (const { re, name } of SECRET_RES) {
       if (re.test(text)) {
@@ -258,12 +271,11 @@ export function checkSecrets(diffText) {
 }
 
 /** emoji 扫描：与 ci.yml 相同码点范围，命中新增行即拒绝。 */
-export function checkEmoji(diffText) {
+export function checkEmoji(diffText, addedLines) {
   const findings = []
-  for (const { path, line, text } of addedLinesFromDiff(diffText)) {
-    const re = new RegExp(EMOJI_RE.source, 'gu')
-    let m
-    while ((m = re.exec(text)) !== null) {
+  // matchAll 复用模块级正则（不改动其 lastIndex），不再逐行 new RegExp。
+  for (const { path, line, text } of addedLines ?? addedLinesFromDiff(diffText)) {
+    for (const m of text.matchAll(EMOJI_GLOBAL_RE)) {
       findings.push({
         severity: `reject`, rule: `emoji`,
         message: `新增行含 emoji 字符 U+` + m[0].codePointAt(0).toString(16).toUpperCase().padStart(4, `0`) + `: ` + path + `:` + line,
@@ -293,16 +305,15 @@ export function checkLockfile(changes) {
   }))
 }
 
-/** 皮肤变更识别：返回 { isSkin, skinIds }。仅源码类变更触发（README/preview/文档不算）。 */
+/** 皮肤变更识别：返回 { isSkin, skinIds }。仅源码类变更触发（README/preview/文档不算）。
+    v2 布局（issue #506）：皮肤事实源是 skin-center 包内的资产目录。 */
 export function checkSkinChanges(changes) {
   const ids = new Set()
   const SKIP_RE = /(README(\.zh)?\.md|README\.i18n\.yaml|preview\/|^docs\/)/i
   for (const c of changes) {
     if (SKIP_RE.test(c.path)) continue
-    let m = c.path.match(/^packages\/skins\/([^/]+)\//)
-    if (!m) m = c.path.match(/^packages\/dsh-skins\/skins\/([^/]+)\//)
-    if (!m) m = c.path.match(/^skins\/([^/]+)\//)
-    if (m && m[1] !== `skin-center`) ids.add(m[1])
+    const m = c.path.match(/^packages\/skins\/skin-center\/skins\/([^/]+)\//)
+    if (m) ids.add(m[1])
   }
   return { isSkin: ids.size > 0, skinIds: [...ids] }
 }
@@ -319,18 +330,18 @@ export function checkCopyright(prInfo, isSkin, repoOwner) {
     message: `皮肤 PR 请提醒作者在 PR 模板「贡献者版权声明（Contributor Copyright）」节声明贡献者版权（在 README 版权表追加一行）`,
   }]
 }
-/** 新皮肤 gallery 适配检查：注册（bundles.js/manifest.js）与预览截图（docs/screenshots）。 */
+/** 新皮肤 gallery 适配检查：注册（manifest.js/styles.js）与预览截图（docs/screenshots）。 */
 export function checkGalleryAdaptation(changes, skinIds) {
   if (!skinIds.length) return []
   const findings = []
-  const touchedGallery = changes.some((c) => c.path === `gallery/bundles.js` || c.path === `gallery/manifest.js`)
+  const touchedGallery = changes.some((c) => c.path === `gallery/styles.js` || c.path === `gallery/manifest.js`)
   const touchedScreenshots = changes.some((c) => c.path.startsWith(`docs/screenshots/`))
   for (const id of skinIds) {
     const isNew = changes.some((c) => c.status === `A` &&
-      (c.path.startsWith(`packages/skins/` + id + `/`) || c.path.startsWith(`packages/dsh-skins/skins/` + id + `/`)))
+      c.path.startsWith(`packages/skins/skin-center/skins/` + id + `/`))
     if (!isNew) continue
     if (!touchedGallery) {
-      findings.push({ severity: `warn`, rule: `gallery`, message: `新皮肤 ` + id + ` 未适配画廊预览：请同步更新 gallery/bundles.js 与 gallery/manifest.js 注册` })
+      findings.push({ severity: `warn`, rule: `gallery`, message: `新皮肤 ` + id + ` 未适配画廊预览：请同步更新 gallery/manifest.js 与 gallery/styles.js 注册` })
     }
     if (!touchedScreenshots) {
       findings.push({ severity: `warn`, rule: `gallery`, message: `新皮肤 ` + id + ` 未提供画廊预览截图：请提交 docs/screenshots/ 截图（light/dark）` })
@@ -387,22 +398,36 @@ function hasEvidence(value) {
     || /https?:\/\/\S*(?:github\.com\/user-attachments\/assets\/|github\.com\/[^)\s]+\/assets\/|githubusercontent\.com\/|[./][^)\s]+\.(?:png|jpe?g|gif|webp|mp4|mov|webm))(?:[?#]\S*)?/i.test(String(value))
 }
 
+/** 模板内既有的字段标签（readField 的合法边界；正文里的普通冒号行不算边界）。 */
+const FIELD_LABELS = new Set([
+  `执行的命令`, `结果摘要`, `使用的 AI 模型`, `使用的编码 Agent 工具`,
+])
+
 /** 读取小节内某字段（label 行之后第一个非空非注释行，或行内冒号后的内容）。 */
 function readField(section, label) {
   const cleaned = String(section).replace(/<!--[\s\S]*?-->/g, ``)
   const lines = cleaned.split(`\n`)
   const idx = lines.findIndex((l) => l.includes(label))
   if (idx === -1) return ``
-  // 优先取 label 行内冒号后的内容；为空时取后续第一个非空行（形如"字段名：内容"的行视为下一个字段）
+  // 优先取 label 行内冒号后的内容；否则收集后续内容直到下一个「已知字段标签」行。
+  // 与 pr-contribution-rules.yml 的 readValidationPart 语义对齐：值允许代码围栏 /
+  // 列表 / 多行；只有模板里既有字段标签才算边界——"- xxx：yyy" 列表行与
+  // "全部通过：typecheck 全绿" 这类冒号正文行都曾被误判为下一个字段，
+  // 导致按模板填写的 PR 被误拒。
   const inline = lines[idx].split(/[：:]/).slice(1).join(``).trim()
   if (inline) return inline
+  const out = []
+  let inFence = false
   for (const line of lines.slice(idx + 1)) {
     const t = line.trim()
-    if (!t) continue
-    if (/^[^：:]{1,24}[：:]\S/.test(t)) return ``
-    return t
+    if (t.startsWith("```")) { inFence = !inFence; continue }
+    if (!inFence && !/^[-*#>`!]/.test(t)) {
+      const m = t.match(/^([^：:]{1,24})[：:]\s*(\S.*)?$/)
+      if (m && FIELD_LABELS.has(m[1].trim())) break
+    }
+    out.push(line)
   }
-  return ``
+  return out.join(`\n`).trim()
 }
 
 /**
@@ -415,7 +440,10 @@ export function checkTemplate(prInfo, repoOwner) {
   const findings = []
   const summary = readSection(body, `摘要（Summary）`)
   const prType = readSection(body, `PR 类型（PR Type）`)
+  const prCategory = readSection(body, `PR 类别（PR Category）`)
   const latest = readSection(body, `最新代码确认（Latest Codebase Confirmation）`)
+  const evidenceRules = readSection(body, `测试证据与上游同步（Test Evidence & Upstream Sync）`)
+  const visualRules = readSection(body, `视觉修复要求（Visual Fix Requirements）`)
   const validation = readSection(body, `本地验证（Local Validation）`)
   const evidence = readSection(body, `用户可见变更证据（Local Feature Evidence）`)
   const packages = readSection(body, `涉及包（Affected Packages）`)
@@ -426,8 +454,11 @@ export function checkTemplate(prInfo, repoOwner) {
   if (!hasAnyCheckedBox(prType)) {
     findings.push({ severity: `reject`, rule: `template`, message: `PR 类型（PR Type）未勾选任何一项` })
   }
+  if (!hasAnyCheckedBox(prCategory)) {
+    findings.push({ severity: `reject`, rule: `template`, message: `PR 类别（PR Category）未勾选任何一项` })
+  }
   if (!hasCheckedLine(latest, `我已基于最新`)) {
-    findings.push({ severity: `reject`, rule: `template`, message: `最新代码确认（Latest Codebase Confirmation）未勾选` })
+    findings.push({ severity: `reject`, rule: `template`, message: `最新代码确认（Latest Codebase Confirmation）未勾选（须基于最新 dev 分支）` })
   }
   const validationCommands = readField(validation, `执行的命令`)
   const validationSummary = readField(validation, `结果摘要`)
@@ -449,10 +480,36 @@ export function checkTemplate(prInfo, repoOwner) {
     }
   }
 
-  const userFacing = hasCheckedLine(prType, `面向用户的功能或行为变更`)
   const isRepoOwner = prInfo.author && prInfo.author.login === repoOwner
-  if (userFacing && !isRepoOwner && !hasEvidence(evidence)) {
-    findings.push({ severity: `reject`, rule: `template`, message: `面向用户的功能 PR 必须附带本地功能证据（截图 / 视频 / 链接）` })
+  if (!isRepoOwner) {
+    // 贡献者 PR 证据门槛（模板「测试证据与上游同步」必填）：自测证据 +
+    // 同步上游最新 dev 分支后重新测试通过的证据，缺失即拒绝。
+    if (!hasCheckedLine(evidenceRules, `我提供了自己本地测试的证据`)) {
+      findings.push({ severity: `reject`, rule: `template`, message: `贡献者 PR 必须勾选「测试证据与上游同步」的自测证据项（提供自己本地测试的证据）` })
+    }
+    if (!hasCheckedLine(evidenceRules, `我已同步上游最新`)) {
+      findings.push({ severity: `reject`, rule: `template`, message: `贡献者 PR 必须勾选「测试证据与上游同步」的上游同步项（同步 dev 最新代码并附重测证据）` })
+    }
+    const userFacing = hasCheckedLine(prType, `面向用户的功能或行为变更`)
+    const visualFix = hasCheckedLine(prType, `视觉修复`)
+    if ((visualFix || userFacing) && !hasEvidence(evidence)) {
+      findings.push({ severity: `reject`, rule: `template`, message: `视觉修复 / 用户可见变更的 PR 必须附带截图或视频证据（视觉修复还需完成态或修复前后对比截图）` })
+    }
+    if (visualFix) {
+      if (!hasCheckedLine(visualRules, `我提供了修复完成后的截图`)) {
+        findings.push({ severity: `reject`, rule: `template`, message: `视觉修复 PR 必须勾选「视觉修复要求」的完成截图项（提供修复完成后的截图）` })
+      }
+      const aiUsed = fullyAI || partialAI
+      if (aiUsed && !hasCheckedLine(visualRules, `修复使用的 AI 模型支持图像输入`)) {
+        findings.push({ severity: `reject`, rule: `template`, message: `视觉修复必须使用支持图像输入的多模态 AI 模型完成（「视觉修复要求」节勾选并填写模型名）` })
+      }
+      if (aiUsed) {
+        const model = readField(ai, `使用的 AI 模型`)
+        if (isBlank(model) || TEXT_ONLY_MODEL_RES.some((re) => re.test(model))) {
+          findings.push({ severity: `reject`, rule: `template`, message: `视觉修复使用的 AI 模型必须是多模态模型（支持图像输入）；纯文本模型（如 deepseek-chat / deepseek-reasoner / gpt-3.5）修复的视觉类 PR 不接受` })
+        }
+      }
+    }
   }
 
   if (packages && !hasAnyCheckedBox(packages)) {
@@ -653,11 +710,13 @@ export function staticReview(prInfo, diff, opts, repoOwner) {
   if (sizeFindings.some((f) => f.severity === `reject`)) {
     return [...sizeFindings, ...checkForbiddenFiles(diff.addedFiles, diff.sizes, opts.maxFileBytes)]
   }
+  // addedLinesFromDiff 解析一次，密钥与 emoji 扫描共享。
+  const addedLines = addedLinesFromDiff(diff.diffText)
   return [
     ...sizeFindings,
     ...checkForbiddenFiles(diff.addedFiles, diff.sizes, opts.maxFileBytes),
-    ...checkSecrets(diff.diffText),
-    ...checkEmoji(diff.diffText),
+    ...checkSecrets(diff.diffText, addedLines),
+    ...checkEmoji(diff.diffText, addedLines),
     ...checkWorkflowChanges(diff.allChanges),
     ...checkLockfile(diff.allChanges),
     ...checkTemplate(prInfo, repoOwner),

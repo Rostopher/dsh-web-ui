@@ -19,13 +19,7 @@
  * - `turn/start`        data = `{ turn }`
  * - `turn/end`          data = `{ turn, reason: { kind: 'error' | ... } }`
  * - `tool/call`         data = `{ turn, step, callId, name, arguments }`
- * - `request/context`   data = `{ provider, model, contextWindow? }` (not a
- *   message; {@link latestContextWindow} tracks the advertised window)
  * - `session/end-seed`  empty data (skipped)
- *
- * `assistant/message` may also carry `usage` (`{ inputTokens, cacheReadTokens,
- * cacheWriteTokens, ... }`); the fold keeps it on the message so the surface
- * can show context occupancy against the tracked window.
  *
  * Assistant content blocks (`text` vs `reasoning`) fold into two separate
  * fields — `text` and `reasoning` — so the surface can show reasoning behind
@@ -75,31 +69,19 @@ export interface RenderMessage {
   /** Set when the owning turn ended in an error. */
   readonly failed?: boolean
   /**
-   * `source.kind` of a user-role message injected by the host rather than
-   * typed by the user (e.g. `agent-instructions`, `plugin`, `skill-catalog`).
-   * Absent for genuine user prompts; the surface hides these by default.
+   * Token usage reported by the final assistant event. cacheReadTokens and
+   * cacheWriteTokens are only attached when the wire carried finite values.
    */
+  readonly usage?: {
+    inputTokens: number
+    outputTokens: number
+    cacheReadTokens?: number
+    cacheWriteTokens?: number
+  }
+  /** Context window for the model that produced this message (from request/context). */
+  readonly contextWindow?: number
+  /** Wire source.kind of a user message (e.g. plugin or user). */
   readonly sourceKind?: string
-  /**
-   * Final usage of this assistant step (from the closing `assistant/message`).
-   * Context occupancy after the step ≈ inputTokens + cacheReadTokens +
-   * cacheWriteTokens — the full prompt the next request builds on.
-   */
-  readonly usage?: MessageUsage
-}
-
-/** Token counters of one finished assistant step. */
-export interface MessageUsage {
-  readonly inputTokens: number
-  readonly cacheReadTokens: number
-  readonly cacheWriteTokens: number
-}
-
-/** Session context window as advertised by the latest `request/context` event. */
-export interface ContextWindow {
-  readonly window: number
-  /** Seq of the event that advertised it (older advertisements never override). */
-  readonly seq: number
 }
 
 /** One tool call attached to an assistant message (callId dedupes repeats). */
@@ -138,18 +120,6 @@ function pickString(value: unknown): string | undefined {
 
 function pickNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
-/** Parse the usage counter of an `assistant/message` payload; undefined when absent. */
-function pickUsage(value: unknown): MessageUsage | undefined {
-  if (!isRecord(value)) return undefined
-  const inputTokens = pickNumber(value['inputTokens'])
-  if (inputTokens === undefined) return undefined
-  return {
-    inputTokens,
-    cacheReadTokens: pickNumber(value['cacheReadTokens']) ?? 0,
-    cacheWriteTokens: pickNumber(value['cacheWriteTokens']) ?? 0,
-  }
 }
 
 /** Fallback message id for events without a stable wire id. */
@@ -221,16 +191,6 @@ function chunkTarget(data: unknown): { text: string; kind: 'text' | 'reasoning';
   return result
 }
 
-/** Max message seq across an existing list, or -1 for an empty list. */
-function watermarkOf(existing: readonly RenderMessage[] | undefined): number {
-  if (existing === undefined) return -1
-  let maxSeq = -1
-  for (const message of existing) {
-    if (message.seq > maxSeq) maxSeq = message.seq
-  }
-  return maxSeq
-}
-
 /** Mutable fold state; message objects are immutable and swapped on change. */
 interface FoldState {
   messages: RenderMessage[]
@@ -243,6 +203,10 @@ interface FoldState {
   messageTurn: Map<string, number>
   /** Deduped tool names per assistant message id. */
   toolNames: Map<string, Set<string>>
+  /** Context window for the current model (from request/context). */
+  contextWindow?: number
+  /** Highest seq folded so far; the replay/watermark gate. */
+  maxSeq: number
 }
 
 function createState(existing: readonly RenderMessage[] | undefined): FoldState {
@@ -254,8 +218,10 @@ function createState(existing: readonly RenderMessage[] | undefined): FoldState 
     turnStepMessage: new Map(),
     messageTurn: new Map(),
     toolNames: new Map(),
+    maxSeq: -1,
   }
   for (const message of messages) {
+    if (message.seq > state.maxSeq) state.maxSeq = message.seq
     state.byId.set(message.id, message)
     if (message.kind !== 'assistant') continue
     // Rebuild the (turn, step) and turn index maps lost when `existing` was
@@ -315,6 +281,7 @@ function retargetTurnStep(state: FoldState, key: string | undefined, oldMessage:
 
 /** Fold one event into the working state. Assumes the event passes the watermark. */
 function applyEvent(state: FoldState, event: WireEvent): void {
+  if (event.seq > state.maxSeq) state.maxSeq = event.seq
   switch (event.type) {
     case 'user/message':
       applyUserMessage(state, event)
@@ -338,6 +305,14 @@ function applyEvent(state: FoldState, event: WireEvent): void {
     case 'tool/call':
       applyToolCall(state, event)
       break
+    case 'request/context': {
+      // Wire shape: { provider, model, contextWindow? }. A present finite
+      // contextWindow seeds every later assistant message that reports usage.
+      const data = isRecord(event.data) ? event.data : {}
+      const window = pickNumber(data['contextWindow'])
+      if (window !== undefined) state.contextWindow = window
+      break
+    }
     // turn/start, session/end-seed, and every other/unknown type render nothing.
     default:
       break
@@ -348,16 +323,28 @@ function applyUserMessage(state: FoldState, event: WireEvent): void {
   const data = isRecord(event.data) ? event.data : {}
   const id = pickString(data['id']) ?? syntheticId('user', event.seq)
   const text = textFromContent(data['content'])
-  const source = isRecord(data['source']) ? data['source'] : undefined
-  const sourceKind = source !== undefined ? pickString(source['kind']) : undefined
-  const injected = sourceKind !== undefined && sourceKind !== 'user' ? { sourceKind } : {}
+  const source = isRecord(data['source']) ? data['source'] : {}
+  const sourceKind = pickString(source['kind'])
   const existing = state.byId.get(id)
   if (existing !== undefined) {
     // Idempotent replace (replayed events update in place, never duplicate).
-    replaceMessage(state, existing, { ...existing, text, ...injected, seq: event.seq, time: event.time })
+    replaceMessage(state, existing, {
+      ...existing,
+      ...(sourceKind !== undefined ? { sourceKind } : {}),
+      text,
+      seq: event.seq,
+      time: event.time,
+    })
     return
   }
-  const message: RenderMessage = { id, kind: 'user', text, ...injected, seq: event.seq, time: event.time }
+  const message: RenderMessage = {
+    id,
+    kind: 'user',
+    text,
+    ...(sourceKind !== undefined ? { sourceKind } : {}),
+    seq: event.seq,
+    time: event.time,
+  }
   state.messages.push(message)
   state.byId.set(id, message)
 }
@@ -370,8 +357,9 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
   const step = pickNumber(data['step'])
   const finalText = textFromContent(messageData['content'])
   const finalReasoning = reasoningFromContent(messageData['content'])
-  const usage = pickUsage(data['usage'])
   const key = tsKey(turn, step)
+  const usage = usageFromData(data)
+  const contextWindow = state.contextWindow
 
   // Finalize the matching assistant message (by id, or by turn/step for the
   // streaming partial that chunks built before the final event arrived).
@@ -387,6 +375,7 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
       // reasoning from the final message keeps the streamed reasoning text.
       ...(finalReasoning !== '' ? { reasoning: finalReasoning } : {}),
       ...(usage !== undefined ? { usage } : {}),
+      ...(usage !== undefined && contextWindow !== undefined ? { contextWindow } : {}),
       seq: event.seq,
       time: event.time,
       pending: false,
@@ -403,6 +392,7 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
     text: finalText,
     ...(finalReasoning !== '' ? { reasoning: finalReasoning } : {}),
     ...(usage !== undefined ? { usage } : {}),
+    ...(usage !== undefined && contextWindow !== undefined ? { contextWindow } : {}),
     seq: event.seq,
     time: event.time,
   }
@@ -413,6 +403,25 @@ function applyAssistantMessage(state: FoldState, event: WireEvent): void {
     state.turnStepMessage.set(key, message)
   }
   if (turn !== undefined) state.messageTurn.set(id, turn)
+}
+
+/**
+ * Extract token usage from an assistant event payload. Only attaches when the
+ * wire carries finite `inputTokens` AND `outputTokens`; the cache fields are
+ * included only for finite numbers.
+ */
+function usageFromData(data: Record<string, unknown>): { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined {
+  const usageData = data['usage']
+  if (!isRecord(usageData)) return undefined
+  const inputTokens = pickNumber(usageData['inputTokens'])
+  const outputTokens = pickNumber(usageData['outputTokens'])
+  if (inputTokens === undefined || outputTokens === undefined) return undefined
+  const usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } = { inputTokens, outputTokens }
+  const cacheReadTokens = pickNumber(usageData['cacheReadTokens'])
+  const cacheWriteTokens = pickNumber(usageData['cacheWriteTokens'])
+  if (cacheReadTokens !== undefined) usage.cacheReadTokens = cacheReadTokens
+  if (cacheWriteTokens !== undefined) usage.cacheWriteTokens = cacheWriteTokens
+  return usage
 }
 
 function applyChunk(state: FoldState, event: WireEvent): void {
@@ -580,9 +589,9 @@ function applyTurnEnd(state: FoldState, event: WireEvent): void {
       ...message,
       ...(wasPending ? { pending: false } : {}),
       ...(failed ? { failed: true } : {}),
-      // seq and time stay the message's own: bumping them to the turn/end
-      // event equalized every sort key in the turn and left the final order
-      // to the lexicographic id tie-break (final answer above its tool steps).
+      // Preserve each step's own final-event seq. Collapsing every message
+      // onto turn/end makes same-turn ordering depend on arbitrary ids.
+      time: event.time,
     })
   }
 }
@@ -595,35 +604,74 @@ function applyTurnEnd(state: FoldState, event: WireEvent): void {
  * @returns messages sorted by seq.
  */
 export function foldEvents(events: readonly WireEvent[], existing?: readonly RenderMessage[]): RenderMessage[] {
-  const sorted = [...events].sort((a, b) => a.seq - b.seq)
-  const watermark = watermarkOf(existing)
-  const state = createState(existing)
-  for (const event of sorted) {
-    if (event.seq <= watermark) continue
-    applyEvent(state, event)
-  }
-  return [...state.messages].sort((a, b) => a.seq - b.seq || (a.id < b.id ? -1 : 1))
+  return new EventFolder(existing).fold(events)
 }
 
 /**
- * Track the session's context window from `request/context` events. Pure
- * companion to {@link foldEvents}: callers feed the same event batches and
- * keep the result; an advertisement only replaces `current` when its seq is
- * newer, so older history pages never roll the window back.
- *
- * @param events - events to scan (any order).
- * @param current - the previously tracked window, if any.
- * @returns the latest advertised window, or `current` unchanged.
+ * Incremental folder for one message stream. Live chat folds one event at a
+ * time; rebuilding the five index maps by scanning every message per event
+ * made that path O(n) per event (O(n * events) per turn). A folder keeps the
+ * indexes alive across folds, applies each event in O(1) map operations, and
+ * returns the previous snapshot identity unchanged when nothing applied, so
+ * React skips the re-render entirely. Replayed events are no-ops: the maxSeq
+ * watermark advanced by the first application skips them, which also makes a
+ * double-invoked React state updater harmless.
  */
-export function latestContextWindow(events: readonly WireEvent[], current?: ContextWindow): ContextWindow | undefined {
-  let latest = current
-  for (const event of events) {
-    if (event.type !== 'request/context') continue
-    if (latest !== undefined && event.seq <= latest.seq) continue
-    const data = isRecord(event.data) ? event.data : {}
-    const window = pickNumber(data['contextWindow'])
-    if (window === undefined || window <= 0) continue
-    latest = { window, seq: event.seq }
+export class EventFolder {
+  private state: FoldState
+  private snapshotList: RenderMessage[] | undefined
+
+  /** @param initial - seed rows (history tail load); omit for an empty stream. */
+  constructor(initial?: readonly RenderMessage[]) {
+    this.state = createState(initial)
   }
-  return latest
+
+  /** Fold one batch incrementally; returns the current snapshot list. */
+  fold(events: readonly WireEvent[]): RenderMessage[] {
+    const sorted = [...events].sort((a, b) => a.seq - b.seq)
+    let applied = false
+    for (const event of sorted) {
+      if (event.seq <= this.state.maxSeq) continue
+      applyEvent(this.state, event)
+      applied = true
+    }
+    if (!applied && this.snapshotList !== undefined) return this.snapshotList
+    this.snapshotList = snapshotOf(this.state)
+    return this.snapshotList
+  }
+
+  /** Replace the whole stream (history reload / session switch). */
+  seed(messages: readonly RenderMessage[]): void {
+    this.state = createState(messages)
+    this.snapshotList = undefined
+  }
+
+  /** Prepend an older history page (exact seam; no overlapping seqs). */
+  prepend(older: readonly RenderMessage[]): void {
+    this.state = createState([...older, ...this.state.messages])
+    this.snapshotList = undefined
+  }
+
+  /** Current snapshot list; a fresh copy whenever the folder changed. */
+  snapshot(): RenderMessage[] {
+    if (this.snapshotList !== undefined) return this.snapshotList
+    this.snapshotList = snapshotOf(this.state)
+    return this.snapshotList
+  }
+}
+
+/** Copy the folder's rows and keep them seq-ordered (skips re-sorting the common ordered case). */
+function snapshotOf(state: FoldState): RenderMessage[] {
+  const out = [...state.messages]
+  let ordered = true
+  for (let index = 1; index < out.length; index += 1) {
+    const prev = out[index - 1]!
+    const current = out[index]!
+    if (prev.seq > current.seq) {
+      ordered = false
+      break
+    }
+  }
+  // Array.sort is stable: equal-seq rows keep their event insertion order.
+  return ordered ? out : out.sort((a, b) => a.seq - b.seq)
 }

@@ -8,7 +8,7 @@
  * shell fails the whole boot when a plugin apply throws, and an external
  * plugin must not take the GUI down.
  */
-import type { ClientContext, SessionId, SettingsScope, SettingsScopeSpec, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, ISessions, IWorkspaces, SessionId, SettingsScope, SettingsScopeSpec } from '@deepseek-ai/dsh-client-runtime/client'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale) and its
@@ -17,13 +17,14 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: pulls the settings-surface Context merge (ctx.settingsScope).
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import { BoardController } from '../core/controller.ts'
-import { ExecutionService } from '../core/execution.ts'
-import { SchedulerService } from '../core/scheduler.ts'
 import { LocalStorageTaskStore } from '../core/store.ts'
+import { claimTaskboardApply, releaseTaskboardApply } from './apply-guard.ts'
 import { mountBoard } from './board-mount.tsx'
 import { mountSidebarEntry } from './sidebar-entry.ts'
 import { TaskBoardSettingsCard, TaskBoardSettingsCardController, type TaskBoardSettings } from './TaskBoardSettingsCard.tsx'
 import { en, zh, type TaskBoardKey } from './locales.ts'
+import { HttpTaskBoardHostTransport } from './host-api.ts'
+import { reportDailyHeartbeat } from './telemetry.ts'
 
 /** Locale namespace this plugin owns. */
 const NS = 'task-board'
@@ -57,7 +58,7 @@ export interface SettingsPluginItemOwnerProps {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /**
-     * Optional rc.6 compatibility binder provided by dsh-web-ui-settings;
+     * Optional rc.6 compatibility binder provided by dsh-web-settings;
      * absent when that group plugin is not installed, so callers fall back to
      * the official settings scope.
      */
@@ -74,20 +75,50 @@ export const inject = ['slots', 'sessions', 'workspaces', 'connection', 'setting
  * @param ctx - client root context (services: sessions, workspaces).
  */
 export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'task-board: dictionaries')
+  // Anonymous install heartbeat (docs/telemetry.md): one beat per browser per
+  // UTC day, package name only, silent failure.
+  reportDailyHeartbeat([{ name: '@linxin666/dsh-client-ui-task-board' }])
+
+  // A duplicated client injection (module factory executed twice in one page
+  // lifetime) would otherwise mount a second sidebar entry and board view.
+  // First application wins; later calls become no-ops (see apply-guard.ts).
+  if (!claimTaskboardApply()) return
+
+  // Release the claim when this fiber unloads (the loader supports plugin
+  // unloads / hot-reloads), so a rebuilt bundle can claim again in the same
+  // page instead of being silently dropped.
+  ctx.effect(() => releaseTaskboardApply, 'task-board: apply claim')
+
+  ctx.effect(() => {
+    try {
+      return ctx.locale.register(NS, { zh, en })
+    } catch {
+      return () => {}
+    }
+  }, 'task-board: dictionaries')
 
   // Plugin configuration card: one staged form over the `task-board` settings
   // namespace, contributed to the Web UI plugin group.
   const binder = ctx.get('webUiSettings') ?? ctx.settingsScope
   const settingsScope = binder.bind<TaskBoardSettings>({ namespace: TASK_BOARD_NS })
   const settingsCard = new TaskBoardSettingsCardController(settingsScope)
-  ctx.slots.inject('web-ui.plugin.item', () => ctx.slots.register({
-    name: 'web-ui.plugin.item',
-    id: 'task-board',
-    order: 110,
-    locale: NS,
-    inject: () => settingsCard.inject(),
-  }, TaskBoardSettingsCard))
+  ctx.slots.inject('web-ui.plugin.item', () => {
+    try {
+      const unregister = ctx.slots.register({
+        name: 'web-ui.plugin.item',
+        id: 'task-board',
+        order: 110,
+        locale: NS,
+        inject: () => settingsCard.inject(),
+      }, TaskBoardSettingsCard)
+      return () => {
+        settingsCard.dispose()
+        unregister()
+      }
+    } catch {
+      return () => {}
+    }
+  })
 
   // The sidebar entry and board view mount once the settings scope settles;
   // while the scope is still loading, the composition default is unknown, so
@@ -96,36 +127,18 @@ export function apply(ctx: ClientContext): void {
   let uiDisposer: (() => void) | undefined
   const mountUi = (): void => {
     if (uiDisposer !== undefined) return
-    const sessions = ctx.sessions
-    const workspaces = ctx.workspaces
+    // Host and browser SDK declarations share the Cordis Context name. Read
+    // the browser faces explicitly so Host-side declaration merging cannot
+    // narrow these two client services during a combined package build.
+    const sessions = ctx.get('sessions') as unknown as ISessions
+    const workspaces = ctx.get('workspaces') as unknown as IWorkspaces
     const connection = ctx.get('connection') as ConnectionHandle
 
     // Core wiring: real runtime faces into the framework-free services.
     const store = new LocalStorageTaskStore()
-    const exec = new ExecutionService({
-      sessions: {
-        list: sessions.list,
-        binding: id => sessions.binding(id as SessionId),
-      },
-      workspaces: {
-        list: workspaces.list,
-        connectWorkspace: id => workspaces.connectWorkspace(id as WorkspaceId),
-      },
-      history: {
-        loadTail: async sessionId => {
-          const response = await connection.api.sessions.history({
-            sessionId: sessionId as SessionId,
-            maxMessages: 20,
-          })
-          return response.result.ok
-            ? { events: response.result.value.events.map(entry => entry.event) }
-            : undefined
-        },
-      },
-    })
     const controller = new BoardController({
       store,
-      exec,
+      transport: new HttpTaskBoardHostTransport(),
       sessions: {
         list: sessions.list,
         open: id => sessions.open(id as SessionId),
@@ -133,25 +146,45 @@ export function apply(ctx: ClientContext): void {
     })
     controller.start()
 
-    // Scheduled runs: a browser-side heartbeat that triggers due tasks through
-    // the same run path as the manual Run button. The first tick is gated on
-    // the session list baseline so a page-load catch-up never fires into a
-    // not-yet-ready runtime; tab visibility recovery ticks immediately.
-    const scheduler = new SchedulerService({
-      tasks: () => controller.getSnapshot().tasks,
-      now: () => Date.now(),
-      runTask: id => controller.runTask(id),
-      applySchedule: (id, nextRunAt, lastTriggeredAt) =>
-        controller.applyScheduleNextRun(id, nextRunAt, lastTriggeredAt),
-      ready: () => sessions.list.getSnapshot().phase === 'ready',
-      environment: {
-        addEventListener: (type, listener) => document.addEventListener(type, listener),
-        removeEventListener: (type, listener) => document.removeEventListener(type, listener),
-      },
-    })
-    scheduler.start()
-
     const disposers: Array<() => void> = []
+
+    // Execution-target option feeds: the workspace list drives the workspace
+    // picker, and the agent-preset roster drives the mode picker. Both are
+    // runtime facts (not ledger state), so the wiring pushes them into the
+    // controller on change; the preset roster is re-read after reconnects
+    // because a reconnect may serve a different deployment.
+    const pushWorkspaceOptions = (): void => {
+      const snapshot = workspaces.list.getSnapshot()
+      controller.setExecutionOptions({
+        workspaces: snapshot.items.map(item => ({
+          workspaceId: item.workspaceId,
+          title: item.title !== '' ? item.title : item.path,
+        })),
+      })
+    }
+    pushWorkspaceOptions()
+    disposers.push(workspaces.list.subscribe(pushWorkspaceOptions))
+    const pushPresetOptions = async (): Promise<void> => {
+      try {
+        const response = await connection.api.agentPresets.list({})
+        if (!response.result.ok) return
+        controller.setExecutionOptions({
+          presets: response.result.value.presets.map(preset => ({
+            id: preset.id,
+            name: preset.name,
+            description: preset.description,
+            broken: preset.broken,
+            isDefault: preset.isDefault,
+          })),
+        })
+      } catch (error) {
+        // A failed roster read leaves the previous options in place; the
+        // picker stays usable and the next reconnect retries the read.
+        console.error('[dsh-task-board] agent preset roster read failed', error)
+      }
+    }
+    void pushPresetOptions()
+    disposers.push(ctx.on('connection/reset', () => { void pushPresetOptions() }))
     try {
       disposers.push(mountSidebarEntry(controller))
       disposers.push(mountBoard(controller))
@@ -162,7 +195,6 @@ export function apply(ctx: ClientContext): void {
 
     uiDisposer = () => {
       for (const dispose of disposers.splice(0)) dispose()
-      scheduler.dispose()
       controller.dispose()
       uiDisposer = undefined
     }

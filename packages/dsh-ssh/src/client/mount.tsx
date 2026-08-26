@@ -3,8 +3,10 @@
  *
  * The `conversation` slot is single-occupant (ui-conversation) and external
  * plugins cannot declare slots, so the panel takes over the center column at
- * the DOM level: a container is appended inside the `[data-pane="conversation"]`
- * grid item (an extra trailing child React never manages), and a stylesheet
+ * the DOM level: a container is appended inside the center column
+ * (`[class*="centerCol"]`, the 0.1.0-rc.6+ AppFrame layout; previously
+ * `[data-pane="conversation"]` on older shells — the mount selector keeps
+ * both, issue #243) as an extra trailing child React never manages, and a stylesheet
  * rule hides the conversation content while the panel is active. Toggling is
  * a data attribute on <html> — no React involvement, so the conversation
  * subtree underneath stays mounted and stateful.
@@ -12,13 +14,14 @@
 import { createRoot, type Root } from 'react-dom/client'
 import type { SshApi } from './api.ts'
 import type { PanelController } from './panel/controller.ts'
+import type { TerminalFontSource } from './panel/helpers.ts'
 import { SshPanel } from './panel/SshPanel.tsx'
 import css from './panel/panel.module.css'
 
 /** The injected panel container (kept in the DOM, hidden when inactive). */
 export const PANEL_VIEW_SELECTOR = '[data-dsh-ssh-view]'
 
-const CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"]'
+const CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"], [class*="centerCol"]'
 const ACTIVE_ATTR = 'data-dsh-ssh-active'
 /** The sibling panel's activation attribute (task board), removed when this panel opens. */
 const OTHER_ACTIVE_ATTR = 'data-dsh-taskboard-active'
@@ -36,9 +39,10 @@ function conversationColumn(): HTMLElement | undefined {
  * to the controller's panelOpen state.
  * @param controller - the panel controller driving the view.
  * @param api - the SSH API client the tabs operate through.
+ * @param terminalFont - live terminal-font setting source (issue #577).
  * @returns disposer unmounting the tree and restoring the column.
  */
-export function mountPanel(controller: PanelController, api: SshApi): () => void {
+export function mountPanel(controller: PanelController, api: SshApi, terminalFont?: TerminalFontSource): () => void {
   let root: Root | undefined
   let container: HTMLDivElement | undefined
 
@@ -55,10 +59,11 @@ export function mountPanel(controller: PanelController, api: SshApi): () => void
     if (column === undefined) return
     container = document.createElement('div')
     container.dataset.dshSshView = ''
+    container.dataset.dshPlugin = 'ssh'
     container.className = css.view
     column.appendChild(container)
     root = createRoot(container)
-    root.render(<SshPanel controller={controller} api={api} />)
+    root.render(<SshPanel controller={controller} api={api} terminalFont={terminalFont} />)
   }
 
   // The frame mounts after boot settlement; watch for the column's arrival.

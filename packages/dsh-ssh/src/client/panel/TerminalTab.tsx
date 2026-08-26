@@ -5,13 +5,13 @@
  * output stays visible and input is disabled. xterm's stylesheet is injected
  * once per page load (module-level guard).
  */
-import { useEffect, useRef, useState } from 'react'
-import { Terminal } from '@xterm/xterm'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { Terminal, type IDisposable } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import type { SshApi, TerminalConnection } from '../api.ts'
 import type { SshHostSummary } from '../../protocol.ts'
 import { XTERM_CSS } from './xterm.css.ts'
-import { errorMessage, tt } from './helpers.ts'
+import { errorMessage, resolveTerminalFontFamily, tt, type TerminalFontSource } from './helpers.ts'
 import css from './panel.module.css'
 
 /** Terminal tab props. */
@@ -21,6 +21,11 @@ export interface TerminalTabProps {
   presetAlias?: string
   /** Monotonic id of the connect request (re-applies presetAlias). */
   requestId?: number
+  /**
+   * Live terminal-font setting source (issue #577). Absent in tests and
+   * legacy mounts: the font then comes from the CSS custom-property chain.
+   */
+  terminalFont?: TerminalFontSource
 }
 
 /** The terminal session lifecycle state shown in the status banner. */
@@ -44,8 +49,14 @@ function ensureXtermCss(): void {
   document.head.appendChild(style)
 }
 
+/** No-op source stand-in so the hook order stays stable without the prop. */
+const NO_FONT_SOURCE: TerminalFontSource = {
+  get: () => undefined,
+  subscribe: () => () => undefined,
+}
+
 /** The xterm terminal view. */
-export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
+export function TerminalTab({ api, presetAlias, requestId, terminalFont }: TerminalTabProps) {
   const [hosts, setHosts] = useState<SshHostSummary[]>([])
   const [alias, setAlias] = useState(presetAlias ?? '')
   const [status, setStatus] = useState<TerminalStatus>({ kind: 'idle' })
@@ -53,8 +64,24 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const connRef = useRef<TerminalConnection | null>(null)
+  const dataSubRef = useRef<IDisposable | null>(null)
+  const fontSource = terminalFont ?? NO_FONT_SOURCE
+  const fontOverride = useSyncExternalStore(fontSource.subscribe, fontSource.get)
 
   useEffect(() => { ensureXtermCss() }, [])
+
+  // Live re-apply a terminal-font change (issue #577): xterm re-measures
+  // and repaints on the options write; a refit keeps cols/rows aligned with
+  // the new metrics and the remote PTY learns the new size.
+  useEffect(() => {
+    const term = termRef.current
+    if (term === null) return
+    const next = resolveTerminalFontFamily(fontOverride)
+    if (term.options.fontFamily === next) return
+    term.options.fontFamily = next
+    fitRef.current?.fit()
+    connRef.current?.resize(term.cols, term.rows)
+  }, [fontOverride])
 
   // Fetch the host list on tab activation.
   useEffect(() => {
@@ -84,6 +111,11 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
       connection.onExit = undefined
       connection.close()
     }
+    // Release the xterm input subscription explicitly and dispose the
+    // terminal so no listener (or the terminal Renderer) survives a
+    // disconnect or the tab unmounting.
+    dataSubRef.current?.dispose()
+    dataSubRef.current = null
     termRef.current?.dispose()
     termRef.current = null
     fitRef.current = null
@@ -92,17 +124,38 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
   // Unmount cleanup (never touches state on an unmounting component).
   useEffect(() => () => { teardown() }, [])
 
-  // Keep the terminal fitted to its container while connected.
+  // Keep the terminal fitted to its container. A window resize is only one
+  // trigger: the status banner appearing after connect, panel resizes, and
+  // sidebar toggles all change the container without a window resize, so the
+  // container itself is observed (otherwise the viewport keeps the pre-banner
+  // height and the last line is clipped below the fold). ResizeObserver may
+  // be absent (jsdom tests); the window listener then remains the only path.
   useEffect(() => {
-    const onResize = (): void => {
+    let lastCols = -1
+    let lastRows = -1
+    const sync = (): void => {
       const term = termRef.current
       const fit = fitRef.current
       if (term === null || fit === null) return
       fit.fit()
-      connRef.current?.resize(term.cols, term.rows)
+      const conn = connRef.current
+      if (conn !== null && (term.cols !== lastCols || term.rows !== lastRows)) {
+        lastCols = term.cols
+        lastRows = term.rows
+        conn.resize(term.cols, term.rows)
+      }
     }
-    window.addEventListener('resize', onResize)
-    return () => { window.removeEventListener('resize', onResize) }
+    window.addEventListener('resize', sync)
+    const container = containerRef.current
+    if (container === null || typeof ResizeObserver === 'undefined') {
+      return () => { window.removeEventListener('resize', sync) }
+    }
+    const observer = new ResizeObserver(() => { sync() })
+    observer.observe(container)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', sync)
+    }
   }, [])
 
   const connect = (): void => {
@@ -116,7 +169,7 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
       convertEol: false,
       cursorBlink: true,
       fontSize: 13,
-      fontFamily: 'Menlo, Consolas, "Liberation Mono", monospace',
+      fontFamily: resolveTerminalFontFamily(fontOverride),
       theme: { background: '#0b0e14', foreground: '#d8dee9', cursor: '#a3b8d0' },
     })
     const fit = new FitAddon()
@@ -128,13 +181,14 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
     fitRef.current = fit
     connRef.current = connection
     let settled = false
-    const dataSub = term.onData(data => { connection.send(data) })
+    dataSubRef.current = term.onData(data => { connection.send(data) })
     connection.onReady = () => { setStatus({ kind: 'connected', alias: target }) }
     connection.onOutput = data => { term.write(data) }
-    connection.onExit = (code, error) => {
+    connection.onExit = (_code, error) => {
       if (settled) return
       settled = true
-      dataSub.dispose()
+      dataSubRef.current?.dispose()
+      dataSubRef.current = null
       term.options.disableStdin = true
       connRef.current = null
       // Keep the last output visible; input is now disabled.
@@ -166,7 +220,7 @@ export function TerminalTab({ api, presetAlias, requestId }: TerminalTabProps) {
       )}
       {status.kind === 'error' && <div className={css.banner} data-kind="error">{tt('terminal.error', { error: status.detail })}</div>}
       <div className={css.termWrap}>
-        <div ref={containerRef} className={css.termContainer} />
+        <div ref={containerRef} className={css.termContainer} data-dsh-part="terminal" />
         {status.kind === 'idle' && (
           <div className={css.termPlaceholder}>{hosts.length === 0 ? tt('hosts.empty') : tt('terminal.placeholder')}</div>
         )}

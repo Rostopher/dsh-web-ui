@@ -1,11 +1,10 @@
 /**
  * The /describe-image/attach route: a browser-to-host upload seam that turns a
- * picked image into a durable attachment reference and returns the
- * `[image attachment …]` note text the browser half splices into the composer
- * draft. The note is plain text, so a text-only model sees the reference and
- * can hand the exact JSON to describe_image; the image bytes themselves never
- * cross into the conversation log — they live in the attachment store, exactly
- * like images the vision pipeline uploads.
+ * picked image into a durable attachment reference and returns both its
+ * `[image attachment ...]` note and self-contained Markdown reference. The
+ * Markdown carries immutable metadata, so a text-only model can pass it intact
+ * to describe_image after a restart or from a PTC nested tool call; image bytes
+ * never cross into the conversation log and remain in the attachment store.
  *
  * The route works without any plugin configuration (the family aggregate mounts
  * this way): the byte bound falls back to the default and the attachment store
@@ -16,10 +15,29 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import { attachmentMarkdown as renderAttachmentMarkdown, parseImageAttachmentRef } from './attachment-reference.ts'
 import { decodeBase64, isImageMimeType, sniffMimeType, DEFAULT_MAX_BYTES, type ImageMimeType } from './media.ts'
+import { UNKNOWN_CAPABILITY, type CapabilityProbe } from './model-capability.ts'
+import { handleModelProbe, handleModelTest, type ProbeKeyResolver } from './model-probe.ts'
+import { isLoopbackRequest } from './loopback.ts'
+import type { Config } from './config-resolve.ts'
+import { readJsonBody, writeJson } from './http.ts'
 
-/** Request-body byte cap: base64 of a {@link DEFAULT_MAX_BYTES} image plus envelope slack. */
+export { renderAttachmentMarkdown as attachmentMarkdown }
+
+/** Request-body byte cap for the default image bound (kept for docs/tests). */
 export const MAX_ATTACH_BODY_BYTES = 16 * 1024 * 1024
+
+/**
+ * JSON request-body cap for one attach: base64 of a `maxBytes` image
+ * inflates to ~4/3 its byte length, plus JSON envelope slack. Scaling it with
+ * the configured image bound (not a fixed 16 MiB) keeps a higher configured
+ * maxBytes usable — a fixed cap silently rejected any image whose base64
+ * exceeded it.
+ */
+export function attachBodyCap(maxBytes: number): number {
+  return Math.ceil(maxBytes / 3) * 4 + 1024
+}
 
 /** Stable error codes the browser half surfaces without leaking internals. */
 export interface AttachError {
@@ -47,12 +65,10 @@ export type AttachOutcome =
 export const METHOD_NOT_ALLOWED: AttachError = { code: 'internal', message: 'only POST is allowed' }
 
 /**
- * In-memory registry of references this process's attach route persisted,
- * keyed by attachment id. Text models that copy only the id out of an
- * `[image attachment …]` note (instead of the whole JSON) still resolve
- * through here, and the attachment store's digest verification runs on the
- * read regardless. Bounded FIFO; ids are content-addressed so a stale entry
- * cannot be confused with another image.
+ * In-memory fallback for callers that copied only a bare attachment id instead
+ * of the complete durable Markdown or note. The attachment store still verifies
+ * the digest on every read. Bounded FIFO; ids are content-addressed so a stale
+ * entry cannot be confused with another image.
  */
 const ATTACHMENT_REF_REGISTRY = new Map<string, ImageAttachmentRef>()
 
@@ -71,22 +87,17 @@ export function registerAttachmentRef(ref: ImageAttachmentRef): void {
 }
 
 /** Look up a persisted reference by its bare attachment id, if still in the registry. */
-export function attachmentRefById(id: string): ImageAttachmentRef | undefined {
-  return ATTACHMENT_REF_REGISTRY.get(id)
+/** decodeURIComponent that returns null instead of throwing on malformed input. */
+export function safeDecodeUriComponent(value: string): string | null {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return null
+  }
 }
 
-/**
- * The markdown image reference inserted into the composer draft: short,
- * renders as an image/link in the conversation, and carries the attachment
- * id in the URL so a text model can extract it and hand it to
- * describe_image (the tool resolves bare ids through the registry).
- * @param id - the attachment id (e.g. `sha256:…`).
- * @returns the markdown text to splice into the draft.
- */
-export function attachmentMarkdown(id: string): string {
-  // The `:` of `sha256:…` stays readable and extractable for the model;
-  // everything else is escaped for the path segment.
-  return `![图片](/describe-image/raw/${encodeURIComponent(id).replace(/%3A/gi, ':')})`
+export function attachmentRefById(id: string): ImageAttachmentRef | undefined {
+  return ATTACHMENT_REF_REGISTRY.get(id)
 }
 
 /** Build the `[image attachment …]` note text for one reference. */
@@ -155,54 +166,68 @@ export async function handleAttach(ctx: Context, maxBytes: number, payload: unkn
       ...validated.payload.name === undefined ? {} : { name: validated.payload.name },
     })
     registerAttachmentRef(ref)
-    return { ok: true, ref, note: attachmentNote(ref), markdown: attachmentMarkdown(ref.attachmentId) }
+    return { ok: true, ref, note: attachmentNote(ref), markdown: renderAttachmentMarkdown(ref) }
   } catch (error) {
     return { ok: false, error: { code: 'internal', message: `attachment store rejected the image: ${(error as Error).message ?? String(error)}` } }
   }
 }
 
-/** Read a JSON request body up to a byte cap; null when unparseable or oversized. */
-async function readJsonBody(req: IncomingMessage, cap: number): Promise<unknown> {
-  const chunks: Buffer[] = []
-  let total = 0
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer
-    chunks.push(buffer)
-    total += buffer.length
-    if (total > cap) return null
-  }
-  const text = Buffer.concat(chunks).toString('utf8')
-  if (text === '') return null
-  try {
-    return JSON.parse(text) as unknown
-  } catch {
-    return null
-  }
-}
-
-/** Write one JSON envelope response. */
-function json(res: ServerResponse, envelope: unknown, status = 200): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(envelope))
+/**
+ * Answer one capability probe (GET /describe-image/capability?session=<id>):
+ * whether the session's effective model positively declares image input.
+ * The browser send hook passes raw image blocks through only on an explicit
+ * acceptsImages; every other answer keeps the legacy describe-image rewrite.
+ * @param probe - the per-mount capability probe.
+ * @param req - the incoming GET request.
+ * @param res - the outgoing response.
+ */
+async function serveCapability(probe: CapabilityProbe | undefined, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const sessionId = new URL(req.url ?? '/', 'http://x').searchParams.get('session') ?? ''
+  const capability = probe === undefined || sessionId === '' ? UNKNOWN_CAPABILITY : await probe(sessionId)
+  writeJson(res, 200, { ok: true, value: capability })
 }
 
 /**
- * Serve one stored image by its bare attachment id (the GET half of the
- * prefix route). Unknown ids and store failures answer 404; the media type
- * comes from the registered reference, never from the URL.
+ * Serve one stored image by its raw-route id. Unknown ids and store failures
+ * answer 404; current Markdown supplies verified reference metadata in its
+ * query string, while legacy id-only Markdown falls back to the process registry.
  * @param ctx - registrant context carrying the optional attachment service.
  * @param req - the incoming GET request.
  * @param res - the outgoing response.
  */
 async function serveRawImage(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const match = /^\/describe-image\/raw\/([^/]+)$/.exec(new URL(req.url ?? '/', 'http://x').pathname)
+  const requestUrl = new URL(req.url ?? '/', 'http://x')
+  const match = /^\/describe-image\/raw\/([^/]+)$/.exec(requestUrl.pathname)
   if (match === null) {
     res.writeHead(404)
     res.end()
     return
   }
-  const id = decodeURIComponent(match[1])
-  const ref = attachmentRefById(id)
+  // Malformed percent-encoding must answer a controlled 404, not throw a
+  // URIError out of the handler.
+  const id = safeDecodeUriComponent(match[1])
+  if (id === null) {
+    res.writeHead(404)
+    res.end()
+    return
+  }
+  let ref: ImageAttachmentRef | undefined
+  const serializedRef = requestUrl.searchParams.get('ref')
+  if (serializedRef !== null) {
+    try {
+      ref = parseImageAttachmentRef(serializedRef)
+    } catch {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    if (ref.attachmentId !== id) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+  }
+  ref ??= attachmentRefById(id)
   if (ref === undefined) {
     res.writeHead(404)
     res.end()
@@ -216,7 +241,7 @@ async function serveRawImage(ctx: Context, req: IncomingMessage, res: ServerResp
   }
   try {
     const stored = await attachments.readImage(ref)
-    res.writeHead(200, { 'content-type': ref.mediaType, 'content-length': String(stored.data.byteLength), 'cache-control': 'private, max-age=3600' })
+    res.writeHead(200, { 'content-type': stored.ref.mediaType, 'content-length': String(stored.data.byteLength), 'cache-control': 'private, max-age=3600' })
     res.end(Buffer.from(stored.data))
   } catch {
     res.writeHead(404)
@@ -230,37 +255,113 @@ async function serveRawImage(ctx: Context, req: IncomingMessage, res: ServerResp
  * immediately; the attachment service is resolved per call.
  * @param ctx - registrant context; webServer is required.
  * @param readMaxBytes - per-request byte-bound reader (defaults to the constant).
+ * @param probe - per-session image-input capability probe for the GET capability route.
  */
-export function registerAttachRoute(ctx: Context, readMaxBytes: () => number = () => DEFAULT_MAX_BYTES): void {
+export function registerAttachRoute(ctx: Context, readMaxBytes: () => number = () => DEFAULT_MAX_BYTES, probe?: CapabilityProbe): void {
   const webserver = ctx.get('webServer')
   if (webserver === undefined) return
   webserver.register({
     kind: 'prefix',
     path: '/describe-image',
     handler: async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      // Loopback fence first: the raw read serves stored image bytes and the
+      // attach POST writes them into the local attachment store, so a LAN or
+      // cross-site caller must be turned away regardless of method or
+      // content-type (same fence as the model probe routes below).
+      if (!isLoopbackRequest(req)) {
+        writeJson(res, 403, { error: 'forbidden: loopback-only' })
+        return
+      }
       // GET /describe-image/raw/<id>: serve the stored bytes so the
       // markdown image reference inserted into the draft renders. The id is
       // content-addressed and loopback-only, so a bare read carries no
       // secrets; the store's digest verification still runs.
       if (req.method === 'GET') {
+        // GET /describe-image/capability?session=<id>: the send hook's
+        // per-session image-input verdict; anything else under GET is the
+        // raw-image read.
+        if (new URL(req.url ?? '/', 'http://x').pathname === '/describe-image/capability') {
+          await serveCapability(probe, req, res)
+          return
+        }
         await serveRawImage(ctx, req, res)
         return
       }
       if (req.method !== 'POST') {
-        json(res, { ok: false, error: METHOD_NOT_ALLOWED }, 405)
+        writeJson(res, 405, { ok: false, error: METHOD_NOT_ALLOWED })
         return
       }
-      const body = await readJsonBody(req, MAX_ATTACH_BODY_BYTES)
+      const maxBytes = readMaxBytes()
+      const body = await readJsonBody(req, { maxBytes: attachBodyCap(maxBytes) })
       if (body === null) {
-        json(res, { ok: false, error: { code: 'internal', message: 'request body must be JSON within 16 MiB' } }, 400)
+        writeJson(res, 400, { ok: false, error: { code: 'internal', message: 'request body must be JSON within the configured image bound' } })
         return
       }
-      const outcome = await handleAttach(ctx, readMaxBytes(), body)
+      const outcome = await handleAttach(ctx, maxBytes, body)
       if (outcome.ok) {
-        json(res, { ok: true, value: { note: outcome.note, markdown: outcome.markdown, ref: outcome.ref } })
+        writeJson(res, 200, { ok: true, value: { note: outcome.note, markdown: outcome.markdown, ref: outcome.ref } })
         return
       }
-      json(res, { ok: false, error: outcome.error }, outcome.error.code === 'rejected' ? 422 : 500)
+      writeJson(res, outcome.error.code === 'rejected' ? 422 : 500, { ok: false, error: outcome.error })
+    },
+  })
+}
+
+/** Request-body byte cap for the model probe: three short connection-field drafts. */
+export const MAX_MODEL_PROBE_BODY_BYTES = 4096
+
+/**
+ * Register the /describe-image/models POST routes on the shared webserver.
+ * Two actions share the prefix: the bare path lists the configured
+ * endpoint's models (the settings card's fetch control — a success doubles
+ * as the endpoint connectivity and credential check), and the /test suffix
+ * pings the selected model with a minimal completion so the card reports
+ * the model's own round-trip latency. The stored settings and the key
+ * resolver are read per request, so the card's unsaved drafts can override
+ * the connection fields before any save, while the key itself never crosses
+ * into the browser (only the id list or the latency comes back).
+ * @param ctx - registrant context; webServer is required.
+ * @param readConfig - per-request reader of the settings currently in effect.
+ * @param resolveKey - the credential resolver for the final configuration.
+ */
+export function registerModelRoutes(ctx: Context, readConfig: () => Config, resolveKey: ProbeKeyResolver): void {
+  const webserver = ctx.get('webServer')
+  if (webserver === undefined) return
+  webserver.register({
+    kind: 'prefix',
+    path: '/describe-image/models',
+    handler: async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      // Loopback fence first: the probe forwards the stored key to the
+      // endpoint named in the settings or drafts, so a LAN or cross-site
+      // caller must be turned away regardless of method or content-type.
+      if (!isLoopbackRequest(req)) {
+        writeJson(res, 403, { error: 'forbidden: loopback-only' })
+        return
+      }
+      if (req.method !== 'POST') {
+        writeJson(res, 405, { ok: false, error: METHOD_NOT_ALLOWED })
+        return
+      }
+      const body = await readJsonBody(req, { maxBytes: MAX_MODEL_PROBE_BODY_BYTES })
+      const overrides = body !== null && typeof body === 'object' && !Array.isArray(body)
+        ? body as Record<string, unknown>
+        : {}
+      const pathname = new URL(req.url ?? '/', 'http://x').pathname
+      if (pathname === '/describe-image/models/test') {
+        const test = await handleModelTest(readConfig(), overrides, resolveKey)
+        if (test.ok) {
+          writeJson(res, 200, { ok: true, value: { latencyMs: test.latencyMs } })
+          return
+        }
+        writeJson(res, test.error.code === 'rejected' ? 422 : 502, { ok: false, error: test.error })
+        return
+      }
+      const outcome = await handleModelProbe(readConfig(), overrides, resolveKey)
+      if (outcome.ok) {
+        writeJson(res, 200, { ok: true, value: { models: outcome.models } })
+        return
+      }
+      writeJson(res, outcome.error.code === 'rejected' ? 422 : 502, { ok: false, error: outcome.error })
     },
   })
 }

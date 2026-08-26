@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect, createServer, type Server as NetServer } from 'node:net'
-import { Server, utils as ssh2Utils, type ClientChannel, type Connection as ServerConnection, type ServerChannel } from 'ssh2'
+import { Server, utils as ssh2Utils, type ClientChannel, type Connection as ServerConnection } from 'ssh2'
 
 /** Test credentials. */
 export const TEST_USER = 'tester'
@@ -35,6 +35,7 @@ function handleCommand(command: string, stream: ClientChannel): void {
     stream.close()
   }
   if (command === 'echo hello') respond('hello\n', 0)
+  else if (command === 'echo ok') respond('ok\n', 0)
   else if (command === 'out-and-err') {
     stream.write('hello out\n')
     // Server-side stderr is writable at runtime; the client-facing types

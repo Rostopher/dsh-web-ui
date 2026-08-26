@@ -14,14 +14,14 @@ DSH Web GUI 插件 __NAME__ —— 由 scripts/plugin-template 生成的骨架�
 ### 从 npm 安装（推荐）
 
 ```sh
-dsh plugin --profile web add @linxin666/dsh-client-ui-__NAME__
+dsh plugin --profile web add @linxin666/dsh-client-ui-__NAME__@latest
 ```
 
 ### 从仓库安装（开发调试）
 
 ```sh
-git clone https://github.com/zhu1090093659/dsh-web-ui.git
-cd dsh-web-ui
+git clone https://github.com/zhu1090093659/dsh-web.git
+cd dsh-web
 pnpm install
 pnpm -r build
 dsh plugin --profile web add link:$(pwd)/packages/__NAME__

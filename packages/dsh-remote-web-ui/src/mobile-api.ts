@@ -9,9 +9,12 @@
  * Security model:
  * - Every request must carry a live paired-device cookie (the same gate
  *   semantic as the LAN fence), enforced before any host call.
- * - Only an explicit allowlist of methods is proxied; privileged domains
- *   (settings, credentials, host actions, goals, subagents, …) are never
- *   reachable from the phone.
+ * - Only an explicit allowlist of methods is proxied ON THIS PREFIX. The
+ *   allowlist constrains the /m/api proxy alone: the same paired-device
+ *   cookie also passes the global api/gate, so a paired device is a
+ *   full-control credential for the host /api surface outside the SDK's
+ *   loopback-pinned privileged set (settings/credentials/agentPreset/host
+ *   actions/llm.discoverModels). Pairing is full device trust.
  * - `session.list` is paged here (the host API returns everything; this
  *   layer slices stable pages) so the phone never transfers the whole list.
  * - The live mux stream is bridged over Server-Sent Events on the same
@@ -24,12 +27,24 @@ import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
 import type { RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
+import type { PendingTracker } from './mobile-pending.ts'
 import type { PairingService } from './pairing.ts'
+import { readBoundedJson, writeJson } from './http.ts'
 import { readCookie } from './gate.ts'
 
-/** Methods the phone surface may call. Everything else is refused. */
+/**
+ * Methods the phone surface may call. Everything else is refused HERE — but
+ * note the paired-device cookie also passes the global api/gate for the full
+ * ApiProxy surface (gate.ts), so a paired phone is a full-control credential:
+ * the allowlist only constrains this /m/api proxy, not the cookie's reach.
+ * stop() revokes every device; the loopback panel can also revoke one
+ * device at a time.
+ */
 const MOBILE_ALLOWLIST = new Set([
+  'host.listDirectory',
+  'workspace.create',
   'workspace.list',
+  'agentPreset.list',
   'session.create',
   'session.list',
   'session.history',
@@ -38,6 +53,7 @@ const MOBILE_ALLOWLIST = new Set([
   'session.models',
   'session.selectModel',
   'session.rename',
+  'session.cancel',
 ])
 
 /**
@@ -46,9 +62,15 @@ const MOBILE_ALLOWLIST = new Set([
  * settings-domain write).
  */
 const MOBILE_PREFERENCES_METHOD = 'mobile.preferences'
+const MOBILE_PENDING_METHOD = 'mobile.pending'
+const MOBILE_RESPOND_METHOD = 'mobile.respond'
+/** Execute a slash command through the host command registry (#1125). */
+const MOBILE_COMMAND_METHOD = 'mobile.command'
 
 /** One session.list page (thin phones load incrementally). */
 const SESSION_PAGE_SIZE = 20
+/** SSE keep-alive ping cadence for the live mux stream (single connection). */
+const DEFAULT_EVENTS_HEARTBEAT_MS = 15_000
 
 /** Encode one list position as an opaque continuation cursor. */
 function sessionListCursor(updatedAt: number, sessionId: string): string {
@@ -76,8 +98,25 @@ export interface MobileApiDeps {
   service: PairingService
   /** The host ApiProxy service (injected by the plugin). */
   apiProxy: ApiProxy
+  /** The pending tracker. */
+  pendingTracker: PendingTracker
   /** The resolved mobile composer preference (live per request). */
   mobileEnterToSend: () => boolean
+  /** SSE keep-alive ping cadence for the mux stream (default 15000 ms; test seam). */
+  eventsHeartbeatMs?: number
+  /**
+   * Optional command dispatcher for executing slash commands on the mobile
+   * surface. When absent, `mobile.command` returns an error; the mobile UI
+   * can still fall back to `session.prompt` (which sends the line to the
+   * model, not the command registry).
+   */
+  commandDispatcher?: {
+    execute(
+      sessionId: string,
+      line: string,
+      signal: AbortSignal,
+    ): Promise<{ ok: true; result: unknown } | { error: string }>
+  }
 }
 
 /** Mobile API route paths. */
@@ -97,16 +136,25 @@ const MOBILE_API_METHOD_PREFIX = `${MOBILE_API_PREFIX}/`
  */
 export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
   const { service, apiProxy, mobileEnterToSend } = deps
+  const eventsHeartbeatMs = deps.eventsHeartbeatMs ?? DEFAULT_EVENTS_HEARTBEAT_MS
+
+  /**
+   * Refresh the paired device's presence and report whether it is live.
+   * The mobile surface (unlike the desktop Web UI) has no `/api/pair/heartbeat`
+   * sender, so any activity on the mobile channel — a gated RPC, or the live
+   * SSE stream staying open — must count as presence. Without this, an
+   * idle-but-connected phone ages past `offlineAfterMs` and the desktop panel
+   * wrongly reports it as disconnected.
+   */
+  const touchDeviceFor = (req: IncomingMessage): boolean => {
+    const deviceId = readCookie(req.headers.cookie, service.config.cookieName)
+    if (deviceId === undefined) return false
+    return service.touchDevice(deviceId)
+  }
 
   /** The phone gate: a live paired-device cookie, or nothing else proceeds. */
   const gateOk = (req: IncomingMessage): boolean => {
-    const deviceId = readCookie(req.headers.cookie, service.config.cookieName)
-    return deviceId !== undefined && service.hasDevice(deviceId)
-  }
-
-  const writeJson = (res: ServerResponse, status: number, body: unknown): void => {
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(body))
+    return touchDeviceFor(req)
   }
 
   const handleMethod = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -125,14 +173,17 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
       return
     }
     const method = pathname.slice(MOBILE_API_METHOD_PREFIX.length)
-    const local = method === MOBILE_PREFERENCES_METHOD
+    const local = method === MOBILE_PREFERENCES_METHOD 
+      || method === MOBILE_PENDING_METHOD 
+      || method === MOBILE_RESPOND_METHOD
+      || method === MOBILE_COMMAND_METHOD
     if (!MOBILE_ALLOWLIST.has(method) && !local) {
       writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: `method ${method} is not exposed to the mobile surface` } })
       return
     }
     let envelope: unknown
     try {
-      envelope = await readJsonBody(req)
+      envelope = await readBoundedJson(req, 64 * 1024)
     } catch {
       writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'invalid json body' } })
       return
@@ -144,15 +195,92 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
       return
     }
     if (local) {
-      writeJson(res, 200, {
-        type: 'server-response',
-        rpcId,
-        result: { ok: true, value: { mobileEnterToSend: mobileEnterToSend() } },
-      })
+      if (method === MOBILE_PREFERENCES_METHOD) {
+        writeJson(res, 200, {
+          type: 'server-response',
+          rpcId,
+          result: { ok: true, value: { mobileEnterToSend: mobileEnterToSend() } },
+        })
+      } else if (method === MOBILE_PENDING_METHOD) {
+        const payload = parsed.payload as any
+        writeJson(res, 200, {
+          type: 'server-response',
+          rpcId,
+          result: { ok: true, value: deps.pendingTracker.pending(payload?.sessionId) },
+        })
+      } else if (method === MOBILE_RESPOND_METHOD) {
+        const payload = parsed.payload as any
+        try {
+          const receipt = await apiProxy.respond({
+            type: 'client-response',
+            rpcId: RpcId(payload.rpcId),
+            result: { ok: true, value: payload.response },
+          })
+          writeJson(res, 200, {
+            type: 'server-response',
+            rpcId,
+            result: { ok: true, value: receipt },
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          writeJson(res, 200, {
+            type: 'server-response',
+            rpcId,
+            result: { ok: false, error: { code: 'internal', message } },
+          })
+        }
+      } else if (method === MOBILE_COMMAND_METHOD) {
+        const payload = parsed.payload as { sessionId?: string; line?: string } | undefined
+        const sessionId = payload?.sessionId
+        const line = payload?.line
+        if (typeof sessionId !== 'string' || typeof line !== 'string') {
+          writeJson(res, 200, {
+            type: 'server-response',
+            rpcId,
+            result: { ok: false, error: { code: 'bad-request', message: 'missing sessionId or line' } },
+          })
+        } else if (deps.commandDispatcher === undefined) {
+          writeJson(res, 200, {
+            type: 'server-response',
+            rpcId,
+            result: { ok: false, error: { code: 'unavailable', message: 'command dispatcher is not available' } },
+          })
+        } else {
+          try {
+            const abort = new AbortController()
+            res.on('close', () => { if (!res.writableEnded) abort.abort() })
+            const outcome = await deps.commandDispatcher.execute(sessionId, line, abort.signal)
+            if ('error' in outcome) {
+              writeJson(res, 200, {
+                type: 'server-response',
+                rpcId,
+                result: { ok: false, error: { code: outcome.error, message: outcome.error } },
+              })
+            } else {
+              writeJson(res, 200, {
+                type: 'server-response',
+                rpcId,
+                result: { ok: true, value: { matched: true, result: outcome.result } },
+              })
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            writeJson(res, 200, {
+              type: 'server-response',
+              rpcId,
+              result: { ok: false, error: { code: 'internal', message } },
+            })
+          }
+        }
+      }
       return
     }
     try {
-      const response = await dispatch(apiProxy, method, parsed?.payload, rpcId)
+      // Cancel the host-side work when the phone goes away mid-call (the
+      // response stream closing before we answer means nobody is listening).
+      const abort = new AbortController()
+      res.on('close', () => { if (!res.writableEnded) abort.abort() })
+      const response = await dispatch(apiProxy, method, parsed?.payload, rpcId, abort.signal)
       writeJson(res, 200, response)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -172,8 +300,10 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
       return
     }
     if (!gateOk(req)) {
-      res.writeHead(403)
-      res.end('forbidden')
+      writeJson(res, 403, {
+        ok: false,
+        error: { code: 'unpaired', message: 'mobile session is not paired' },
+      })
       return
     }
     res.writeHead(200, {
@@ -185,12 +315,16 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
     let closed = false
     const heartbeat = setInterval(() => {
       if (closed) return
+      // An open SSE stream proves the phone is still live even while the agent
+      // idles (no RPC traffic), so refresh presence alongside the transport
+      // keepalive — otherwise an idle phone drifts to "disconnected".
+      touchDeviceFor(req)
       try {
         res.write(': ping\n\n')
       } catch {
         // The write failed; the close handler tears the subscription down.
       }
-    }, 15_000)
+    }, eventsHeartbeatMs)
     const onClose = (): void => {
       if (closed) return
       closed = true
@@ -203,6 +337,7 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
       const frames = apiProxy.events.mux({ rpcId: RpcId(`mobile-mux-${Date.now().toString(36)}`), payload: {} }, controller.signal)
       for await (const frame of frames) {
         if (closed) break
+        deps.pendingTracker.onFrame(frame as any)
         res.write(`data: ${JSON.stringify(frame)}\n\n`)
       }
     } catch {
@@ -220,25 +355,15 @@ export function makeMobileApiRoutes(deps: MobileApiDeps): WebRoute[] {
   ]
 }
 
-/** Read a request body as JSON (bounded). */
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer
-    size += buffer.length
-    if (size > 64 * 1024) throw new Error('body too large')
-    chunks.push(buffer)
-  }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
-}
-
 /** Dispatch one allowlisted method through the host ApiProxy. */
-async function dispatch(apiProxy: ApiProxy, method: string, payload: unknown, rpcId: string): Promise<unknown> {
+async function dispatch(apiProxy: ApiProxy, method: string, payload: unknown, rpcId: string, signal?: AbortSignal): Promise<unknown> {
   const request: RpcRequest<unknown> = { rpcId: RpcId(rpcId), payload }
   if (method === 'session.list') {
     const full = await apiProxy.sessions.list(request as never)
-    if (!full.result.ok) return full
+    // The error path must carry the same 'server-response' envelope the
+    // success path builds, or the phone's callUnary throws a transport error
+    // and masks the real business error.
+    if (!full.result.ok) return { type: 'server-response' as const, rpcId, result: full.result }
     const items = full.result.value.items as Array<{ updatedAt: number; sessionId: string }>
     const cursor = (payload as { cursor?: string } | undefined)?.cursor
     // Every call pages (the first call with no cursor IS the first page):
@@ -278,12 +403,16 @@ async function dispatch(apiProxy: ApiProxy, method: string, payload: unknown, rp
     result: response.result,
   })
   if (method === 'workspace.list') return wrap(await apiProxy.workspace.list(request as never))
+  if (method === 'workspace.create') return wrap(await apiProxy.workspace.create(request as never))
+  if (method === 'host.listDirectory') return wrap(await apiProxy.host.listDirectory(request as never, signal ?? new AbortController().signal))
+  if (method === 'agentPreset.list') return wrap(await apiProxy.agentPresets.list(request as never))
   if (method === 'session.create') return wrap(await apiProxy.sessions.create(request as never))
   if (method === 'session.history') return wrap(await apiProxy.sessions.history(request as never))
-  if (method === 'session.search') return wrap(await apiProxy.sessions.search(request as never, new AbortController().signal))
+  if (method === 'session.search') return wrap(await apiProxy.sessions.search(request as never, signal ?? new AbortController().signal))
   if (method === 'session.prompt') return wrap(await apiProxy.sessions.prompt(request as never))
   if (method === 'session.models') return wrap(await apiProxy.sessions.models(request as never))
   if (method === 'session.selectModel') return wrap(await apiProxy.sessions.selectModel(request as never))
   if (method === 'session.rename') return wrap(await apiProxy.sessions.rename(request as never))
+  if (method === 'session.cancel') return wrap(await apiProxy.sessions.cancel(request as never))
   throw new Error(`unhandled allowlisted method ${method}`)
 }

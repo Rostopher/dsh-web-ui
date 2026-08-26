@@ -1,118 +1,134 @@
 /**
- * Tests for scripts/dsh-skin: the pure managed-section helpers and the
- * `use official` command against a throwaway HOME, so the real ~/.dsh is
- * never touched.
+ * Tests for scripts/dsh-skin (v2): validate / install / use / list / current
+ * against throwaway DSH_HOME / DSH_SKINS_HOME, so the real ~/.dsh is never
+ * touched.
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import dshSkin from './dsh-skin'
 
-const { SKINS, MANAGED_START, MANAGED_END, renderManaged, stripManaged, stripLegacySkinRows, currentActive } = dshSkin
-
-// fileURLToPath, not URL.pathname: the latter keeps a leading slash on
-// Windows (/D:/...), which node then mis-resolves as D:\D:\...
 const SCRIPT = fileURLToPath(new URL('./dsh-skin', import.meta.url))
 
-/** A throwaway DSH_HOME with a patch fixture; returns the patch path. */
-function fakeHome() {
-  const home = mkdtempSync(join(tmpdir(), 'dsh-skin-test-'))
-  mkdirSync(join(home, '.dsh'), { recursive: true })
-  return home
+function fixtureSkin(root, id, extra = {}) {
+  const dir = join(root, id)
+  mkdirSync(join(dir, 'assets'), { recursive: true })
+  writeFileSync(join(dir, 'skin.json'), JSON.stringify({
+    skinManifestVersion: 2,
+    id,
+    name: id,
+    nameEn: id,
+    version: '1.0.0',
+    author: 'tester',
+    contributes: { stylesheet: 'skin.css' },
+    ...extra,
+  }))
+  writeFileSync(join(dir, 'skin.css'), ':root { --dsw-alias-bg-base: #112233; }\n')
+  return dir
 }
 
-function patchPath(home) {
-  return join(home, '.dsh', 'cordis.patch.yml')
+function run(args, env = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'dsh-skin-cli-'))
+  const fullEnv = { ...process.env, DSH_HOME: join(home, '.dsh'), ...env }
+  try {
+    const out = execFileSync('node', [SCRIPT, ...args], { env: fullEnv, encoding: 'utf8' })
+    return { code: 0, out, home }
+  } catch (error) {
+    return { code: error.status ?? 1, out: String(error.stdout ?? '') + String(error.stderr ?? ''), home }
+  }
 }
 
-test('renderManaged(null) disables every skin and inserts nothing', () => {
-  const rendered = renderManaged(null)
-  assert.ok(rendered.startsWith(MANAGED_START))
-  assert.ok(rendered.endsWith(MANAGED_END))
-  for (const name of Object.keys(SKINS)) {
-    assert.ok(rendered.includes(`- id: ${SKINS[name].id}\n  disabled: true`), `expected ${name} disabled`)
-  }
-  assert.ok(!rendered.includes('- insert:'), 'official must carry no insert row')
+test('validate passes a well-formed skin', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-skin-fixture-'))
+  const dir = fixtureSkin(root, 'demo')
+  const r = run(['validate', dir])
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /result: PASS/)
+  rmSync(root, { recursive: true, force: true })
 })
 
-test('renderManaged(name) keeps one insert row for a non-wired skin', () => {
-  const rendered = renderManaged('qq98')
-  assert.ok(rendered.includes('- insert:'))
-  assert.ok(rendered.includes(`- id: ${SKINS.qq98.id}`))
-  // The active skin itself must not be disabled.
-  assert.ok(!rendered.includes(`- id: ${SKINS.qq98.id}\n  disabled: true`))
+test('validate fails closed on a whitelist violation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-skin-fixture-'))
+  const dir = fixtureSkin(root, 'evil')
+  writeFileSync(join(dir, 'skin.css'), '.a { background: url(https://evil.example/x.png); }\n')
+  const r = run(['validate', dir])
+  assert.equal(r.code, 1)
+  assert.match(r.out, /remote URL/)
+  rmSync(root, { recursive: true, force: true })
 })
 
-test('stripManaged removes only the managed section', () => {
-  const patch = `# header\n- id: other\n\n${MANAGED_START}\n- id: ui-skin-xp\n  disabled: true\n${MANAGED_END}\n# footer\n`
-  const stripped = stripManaged(patch)
-  assert.ok(stripped.includes('# header'))
-  assert.ok(stripped.includes('# footer'))
-  assert.ok(!stripped.includes('ui-skin-xp'))
-  assert.ok(!stripped.includes(MANAGED_START))
+test('install copies a valid skin into the user skins dir; uninstall removes it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-skin-fixture-'))
+  const dir = fixtureSkin(root, 'demo')
+  const install = run(['install', dir])
+  assert.equal(install.code, 0, install.out)
+  const installed = join(install.home, '.dsh', 'skins', 'demo')
+  assert.ok(existsSync(join(installed, 'skin.json')))
+  // Second install refuses without --force.
+  const again = run(['install', dir], { DSH_HOME: join(install.home, '.dsh') })
+  assert.equal(again.code, 1)
+  assert.match(again.out, /already exists/)
+  const forced = run(['install', dir, '--force'], { DSH_HOME: join(install.home, '.dsh') })
+  assert.equal(forced.code, 0, forced.out)
+  const uninstall = run(['uninstall', 'demo'], { DSH_HOME: join(install.home, '.dsh') })
+  assert.equal(uninstall.code, 0, uninstall.out)
+  assert.ok(!existsSync(installed))
+  rmSync(root, { recursive: true, force: true })
 })
 
-test('stripManaged throws on an unterminated managed section', () => {
-  const patch = `${MANAGED_START}\n- id: ui-skin-xp\n  disabled: true\n`
-  assert.throws(() => stripManaged(patch), /unterminated/)
+test('install refuses hooks-bearing skins without --allow-hooks', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-skin-fixture-'))
+  const dir = fixtureSkin(root, 'hooked', {
+    facets: { client: { entry: 'hooks.mjs', apiVersion: 'x-org.linxin666.skin-center/v1alpha1' } },
+  })
+  writeFileSync(join(dir, 'hooks.mjs'), 'export default () => ({ apply() {} })\n')
+  const r = run(['install', dir])
+  assert.equal(r.code, 1)
+  assert.match(r.out, /--allow-hooks/)
+  const allowed = run(['install', dir, '--allow-hooks'], { DSH_HOME: join(r.home, '.dsh') })
+  assert.equal(allowed.code, 0, allowed.out)
+  rmSync(root, { recursive: true, force: true })
 })
 
-test('currentActive returns null when every skin is disabled', () => {
-  assert.equal(currentActive(renderManaged(null)), null)
+test('use writes the selection; current reads it; official clears it', () => {
+  const use = run(['use', 'harbor'])
+  assert.equal(use.code, 0, use.out)
+  const env = { DSH_HOME: join(use.home, '.dsh') }
+  const current = run(['current'], env)
+  assert.equal(current.out.trim(), 'harbor')
+  const off = run(['use', 'official'], env)
+  assert.equal(off.code, 0, off.out)
+  const after = run(['current'], env)
+  assert.equal(after.out.trim(), 'none')
 })
 
-test('use official restores the stock look on a throwaway DSH_HOME', () => {
-  const home = fakeHome()
-  try {
-    const patch = patchPath(home)
-    const fixture = `# custom row survives\n- id: ui-subagent-tree\n  name: '@deepseek-ai/dsh-client-ui-subagent-tree'\n`
-    writeFileSync(patch, fixture)
-    execFileSync(process.execPath, [SCRIPT, 'use', 'official'], {
-      env: { ...process.env, DSH_HOME: join(home, '.dsh'), DSH_SKIN_REPO: join(home, 'code', 'dsh-web-ui') },
-    })
-    const after = readFileSync(patch, 'utf8')
-    assert.ok(after.includes('# custom row survives'), 'non-managed rows must be preserved')
-    assert.ok(after.includes(MANAGED_START))
-    for (const name of Object.keys(SKINS)) {
-      assert.ok(after.includes(`- id: ${SKINS[name].id}\n  disabled: true`))
-    }
-    assert.ok(!after.includes('- insert:'), 'official must not insert any skin row')
-
-    // The CLI's own reading agrees: current prints none.
-    const current = execFileSync(process.execPath, [SCRIPT, 'current'], {
-      env: { ...process.env, DSH_HOME: join(home, '.dsh'), DSH_SKIN_REPO: join(home, 'code', 'dsh-web-ui') },
-      encoding: 'utf8',
-    })
-    assert.equal(current.trim(), 'none')
-  } finally {
-    rmSync(home, { recursive: true, force: true })
-  }
+test('use rejects an unknown skin', () => {
+  const r = run(['use', 'no-such-skin'])
+  assert.equal(r.code, 1)
+  assert.match(r.out, /unknown skin/)
 })
 
-test('use <name> still writes an insert row for a non-wired skin', () => {
-  const home = fakeHome()
-  try {
-    // ensureSymlink requires the skin source dir under DSH_SKIN_REPO.
-    const repo = join(home, 'code', 'dsh-web-ui')
-    mkdirSync(join(repo, 'packages', 'skins', 'qq98'), { recursive: true })
-    const patch = patchPath(home)
-    writeFileSync(patch, '')
-    execFileSync(process.execPath, [SCRIPT, 'use', 'qq98'], {
-      env: { ...process.env, DSH_HOME: join(home, '.dsh'), DSH_SKIN_REPO: repo },
-    })
-    const after = readFileSync(patch, 'utf8')
-    assert.ok(after.includes('- insert:'))
-    assert.ok(after.includes(`- id: ${SKINS.qq98.id}`))
-    const current = execFileSync(process.execPath, [SCRIPT, 'current'], {
-      env: { ...process.env, DSH_HOME: join(home, '.dsh'), DSH_SKIN_REPO: repo },
-      encoding: 'utf8',
-    })
-    assert.equal(current.trim(), 'qq98')
-  } finally {
-    rmSync(home, { recursive: true, force: true })
-  }
+test('list shows builtin skins and diagnostics', () => {
+  const r = run(['list'])
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /harbor \[builtin\]/)
+  assert.match(r.out, /active:/)
+})
+test('validate warns (not fails) on a partial primary-action token set', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-skin-fixture-'))
+  const dir = fixtureSkin(root, 'halftone')
+  writeFileSync(join(dir, 'skin.css'), [
+    ':root {',
+    '  --dsw-alias-button-primary-fill: #2fbf8f;',
+    '  --dsw-alias-button-primary-hover: #45cba0;',
+    '}',
+  ].join('\n'))
+  const r = run(['validate', dir])
+  assert.equal(r.code, 0, r.out)
+  assert.match(r.out, /warning: primary action contract: "label-primary-foreground" is not defined/)
+  assert.match(r.out, /warning: primary action contrast/)
+  rmSync(root, { recursive: true, force: true })
 })

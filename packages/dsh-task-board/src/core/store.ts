@@ -1,21 +1,16 @@
 /**
- * Task persistence: a small storage seam with a localStorage backend.
+ * Legacy v1 browser persistence and the store seam used by pure client tests.
  *
- * The task-board client plugin runs in the browser, and dsh exposes no
- * browser-writable file channel (same conclusion the skin-center research
- * reached for cordis.patch.yml), so tasks persist in the browser's
- * localStorage under a versioned key — the same persistence mechanism dsh's
- * own client snapshot stores use (`createSnapshotStore` persist). Data
- * survives page refreshes and dsh restarts (same origin), and survives
- * plugin uninstall (the key is simply left in place).
+ * Production v2 state is Host-authoritative. This backend is retained only to
+ * read `dsh.taskBoard.v1` for one-time import; the old value is never removed,
+ * so it remains a read-only rollback copy after migration.
  *
  * The seam keeps the backend swappable (e.g. an IndexedDB or a host-file
  * channel later); tests run against the in-memory backend and a jsdom
  * localStorage backend.
  */
 import { isValidCron } from './schedule.ts'
-import type { ScheduleRule, TaskRecord, TaskStatus } from './tasks.ts'
-import { isTaskStatus } from './tasks.ts'
+import { isTaskPermission, isTaskStatus, normalizeTargetId, type ScheduleRule, type TaskRecord, type TaskPermission, type TaskStatus } from './tasks.ts'
 
 /** Persistence seam for the task ledger. */
 export interface TaskStore {
@@ -64,6 +59,9 @@ function isTaskRecordShape(value: unknown): value is Omit<TaskRecord, 'status'> 
   if (typeof record.prompt !== 'string') return false
   if (typeof record.createdAt !== 'number') return false
   if (typeof record.updatedAt !== 'number') return false
+  if (record.workspaceId !== undefined && typeof record.workspaceId !== 'string') return false
+  if (record.mode !== undefined && typeof record.mode !== 'string') return false
+  if (record.permission !== undefined && typeof record.permission !== 'string') return false
   if (!Array.isArray(record.executions)) return false
   for (const execution of record.executions) {
     if (typeof execution !== 'object' || execution === null) return false
@@ -136,6 +134,13 @@ export function parseLedger(raw: string | null): TaskRecord[] {
     // clear a malformed persisted rule rather than leave it in the row.
     const task: TaskRecord = { ...row, status: normalizeStatus(row.status) }
     task.schedule = normalizeSchedule(row.schedule)
+    // Execution targets are normalized like the schedule: blank strings
+    // clear the pin and unknown permission strings from a future version
+    // fall back to the session default instead of dropping the row.
+    task.workspaceId = normalizeTargetId(row.workspaceId)
+    task.mode = normalizeTargetId(row.mode)
+    task.archivedAt = typeof row.archivedAt === 'number' && Number.isFinite(row.archivedAt) ? row.archivedAt : undefined
+    task.permission = isTaskPermission(row.permission) ? row.permission as TaskPermission : undefined
     tasks.push(task)
   }
   return tasks

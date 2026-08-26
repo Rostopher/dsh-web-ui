@@ -14,14 +14,14 @@ this file with the real description once the plugin is implemented.
 ### From npm (recommended)
 
 ```sh
-dsh plugin --profile web add @linxin666/dsh-client-ui-__NAME__
+dsh plugin --profile web add @linxin666/dsh-client-ui-__NAME__@latest
 ```
 
 ### From the repository (development)
 
 ```sh
-git clone https://github.com/zhu1090093659/dsh-web-ui.git
-cd dsh-web-ui
+git clone https://github.com/zhu1090093659/dsh-web.git
+cd dsh-web
 pnpm install
 pnpm -r build
 dsh plugin --profile web add link:$(pwd)/packages/__NAME__

@@ -7,11 +7,15 @@
 import { useEffect, useState } from 'react'
 import type { BoardController } from '../../core/controller.ts'
 import { isValidCron } from '../../core/schedule.ts'
-import { MANUAL_STATUSES, type ExecutionRecord, type TaskRecord, type TaskStatus } from '../../core/tasks.ts'
+import { MANUAL_STATUSES, TASK_PERMISSIONS, type ExecutionRecord, type TaskPermission, type TaskRecord } from '../../core/tasks.ts'
+import { canEditTaskContent } from '../../core/use-cases/task-update.ts'
 import { t, type TaskBoardKey } from '../locales.ts'
+import { SCHEDULE_PRESETS } from '../schedule-presets.ts'
 import css from '../board.module.css'
 import { ConfirmDialog } from './ConfirmDialog.tsx'
-import { formatTime } from './TaskCard.tsx'
+import { EditTaskModal } from './EditTaskModal.tsx'
+import { formatHostTimestamp, formatTime } from './TaskCard.tsx'
+import { STATUS_KEY } from './status-key.ts'
 
 /** Execution outcome → locale key. */
 const RESULT_KEY: Record<NonNullable<ExecutionRecord['result']>, TaskBoardKey> = {
@@ -20,17 +24,8 @@ const RESULT_KEY: Record<NonNullable<ExecutionRecord['result']>, TaskBoardKey> =
   cancelled: 'detail.result.cancelled',
 }
 
-/** Status → locale key (detail badge). */
-const STATUS_KEY: Record<TaskStatus, TaskBoardKey> = {
-  backlog: 'board.status.backlog',
-  todo: 'board.status.todo',
-  running: 'board.status.running',
-  done: 'board.status.done',
-  failed: 'board.status.failed',
-}
-
 /** One execution-history row. */
-function ExecutionRow({ execution, onOpen }: { execution: ExecutionRecord; onOpen: (sessionId: string) => void }) {
+function ExecutionRow({ execution, timeZone, onOpen }: { execution: ExecutionRecord; timeZone?: string; onOpen: (sessionId: string) => void }) {
   const result = execution.result
   return (
     <li className={css.executionRow} data-result={result}>
@@ -38,8 +33,8 @@ function ExecutionRow({ execution, onOpen }: { execution: ExecutionRecord; onOpe
         {result === undefined ? t('detail.result.running') : t(RESULT_KEY[result])}
       </span>
       <span className={css.executionTimes}>
-        {t('detail.executionStarted')} {formatTime(execution.startedAt)}
-        {execution.endedAt !== undefined && ` · ${t('detail.executionEnded')} ${formatTime(execution.endedAt)}`}
+        {t('detail.executionStarted')} {formatTime(execution.startedAt, timeZone)}
+        {execution.endedAt !== undefined && ` · ${t('detail.executionEnded')} ${formatTime(execution.endedAt, timeZone)}`}
       </span>
       {execution.sessionId !== undefined && (
         <button
@@ -58,22 +53,86 @@ function ExecutionRow({ execution, onOpen }: { execution: ExecutionRecord; onOpe
   )
 }
 
-/** Common scheduled-run presets (cron → locale label). */
-const SCHEDULE_PRESETS: ReadonlyArray<{ cron: string; label: TaskBoardKey }> = [
-  { cron: '0 9 * * *', label: 'detail.schedule.preset.daily9' },
-  { cron: '0 * * * *', label: 'detail.schedule.preset.hourly' },
-  { cron: '*/10 * * * *', label: 'detail.schedule.preset.tenMin' },
-  { cron: '0 9 * * 1', label: 'detail.schedule.preset.weeklyMon9' },
-]
+/** The execution-target editor: workspace / mode / permission pickers. */
+function ExecutionSettingsSection({ controller, task, pending }: { controller: BoardController; task: TaskRecord; pending: boolean }) {
+  const [options, setOptions] = useState(controller.getSnapshot().executionOptions)
+  useEffect(
+    () => controller.subscribe(() => setOptions(controller.getSnapshot().executionOptions)),
+    [controller],
+  )
+  const workspaceId = task.workspaceId ?? ''
+  const mode = task.mode ?? ''
+  const permission = task.permission ?? ''
+  // A pinned target may disappear from the runtime (workspace deleted,
+  // preset removed); keep it selectable as a stale row instead of silently
+  // dropping it, so the user sees exactly what the task will ask for.
+  const workspaceKnown = workspaceId === '' || options.workspaces.some(item => item.workspaceId === workspaceId)
+  const modeKnown = mode === '' || options.presets.some(item => item.id === mode)
+  return (
+    <section className={css.detailSection}>
+      <h4>{t('detail.executionSettings')}</h4>
+      <p className={css.detailText}>{t('exec.hint')}</p>
+      <label className={css.field}>
+        <span className={css.fieldLabel}>{t('new.workspace')}</span>
+        <select
+          className={css.select}
+          value={workspaceId}
+          disabled={pending}
+          onChange={event => { controller.updateTask(task.id, { workspaceId: event.target.value }) }}
+        >
+          <option value="">{t('exec.workspace.recent')}</option>
+          {!workspaceKnown && <option value={workspaceId}>{workspaceId}{t('exec.mode.removed')}</option>}
+          {options.workspaces.map(workspace => (
+            <option key={workspace.workspaceId} value={workspace.workspaceId}>{workspace.title}</option>
+          ))}
+        </select>
+      </label>
+      <label className={css.field}>
+        <span className={css.fieldLabel}>{t('new.mode')}</span>
+        <select
+          className={css.select}
+          value={mode}
+          disabled={pending}
+          onChange={event => { controller.updateTask(task.id, { mode: event.target.value }) }}
+        >
+          <option value="">{t('exec.mode.default')}</option>
+          {!modeKnown && <option value={mode}>{mode}{t('exec.mode.removed')}</option>}
+          {options.presets.map(preset => (
+            <option key={preset.id} value={preset.id} disabled={preset.broken !== undefined}>
+              {preset.name ?? preset.id}
+              {preset.isDefault ? t('exec.mode.defaultSuffix') : ''}
+              {preset.broken !== undefined ? t('exec.mode.brokenSuffix') : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className={css.field}>
+        <span className={css.fieldLabel}>{t('new.permission')}</span>
+        <select
+          className={css.select}
+          value={permission}
+          disabled={pending}
+          onChange={event => { controller.updateTask(task.id, { permission: event.target.value === '' ? undefined : event.target.value as TaskPermission }) }}
+        >
+          <option value="">{t('exec.permission.default')}</option>
+          {TASK_PERMISSIONS.map(id => (
+            <option key={id} value={id}>{t(`exec.permission.${id}` as TaskBoardKey)}</option>
+          ))}
+        </select>
+      </label>
+    </section>
+  )
+}
 
 /** The scheduled-runs editor: enable toggle, cron input + presets, next-run info. */
-function ScheduleSection({ controller, task }: { controller: BoardController; task: TaskRecord }) {
+function ScheduleSection({ controller, task, pending }: { controller: BoardController; task: TaskRecord; pending: boolean }) {
   const schedule = task.schedule
   const [cron, setCron] = useState(schedule?.cron ?? '0 9 * * *')
   const [enabled, setEnabled] = useState(schedule?.enabled ?? false)
   const [nextRunAt, setNextRunAt] = useState<number | undefined>(schedule?.nextRunAt)
   const [lastTriggeredAt, setLastTriggeredAt] = useState<number | undefined>(schedule?.lastTriggeredAt)
   const [error, setError] = useState<string | undefined>(undefined)
+  const timeZone = controller.getSnapshot().host?.scheduler.timeZone
 
   // Keep the editor in sync when the task record changes underneath (the
   // schedule rolls forward as runs trigger).
@@ -105,8 +164,11 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
       return
     }
     setError(undefined)
-    if (next && trimmed !== schedule?.cron) controller.setSchedule(task.id, { cron: trimmed })
-    if (controller.setSchedule(task.id, { enabled: next })) setEnabled(next)
+    const submitted = controller.setSchedule(task.id, {
+      enabled: next,
+      ...(next && trimmed !== schedule?.cron ? { cron: trimmed } : {}),
+    })
+    if (submitted && !controller.isHostBacked()) setEnabled(next)
   }
 
   const applyPreset = (preset: string): void => {
@@ -120,8 +182,8 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
     ? t('detail.schedule.notScheduled')
     : nextRunAt <= Date.now()
       ? t('detail.schedule.dueSoon')
-      : new Date(nextRunAt).toLocaleString()
-  const lastLabel = lastTriggeredAt === undefined ? '—' : new Date(lastTriggeredAt).toLocaleString()
+      : formatHostTimestamp(nextRunAt, timeZone)
+  const lastLabel = lastTriggeredAt === undefined ? '—' : formatHostTimestamp(lastTriggeredAt, timeZone)
 
   return (
     <section className={css.detailSection}>
@@ -130,6 +192,7 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
         <input
           type="checkbox"
           checked={enabled}
+          disabled={pending}
           onChange={event => { toggleEnabled(event.target.checked) }}
         />
         <span>{t('detail.schedule.enable')}</span>
@@ -138,6 +201,7 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
         <input
           className={`${css.input} ${css.scheduleInput}${error !== undefined ? ` ${css.scheduleInputInvalid}` : ''}`}
           value={cron}
+          disabled={pending}
           placeholder="0 9 * * *"
           spellCheck={false}
           aria-label={t('detail.schedule.cron')}
@@ -148,6 +212,7 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
         <select
           className={css.schedulePreset}
           value=""
+          disabled={pending}
           aria-label={t('detail.schedule.presets')}
           onChange={event => { applyPreset(event.target.value) }}
         >
@@ -169,19 +234,29 @@ function ScheduleSection({ controller, task }: { controller: BoardController; ta
 /** Task detail overlay. */
 export function TaskDetail({ controller, task }: { controller: BoardController; task: TaskRecord }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
-  const running = task.status === 'running'
+  const [showEdit, setShowEdit] = useState(false)
 
   // Keep the overlay in sync if the task record changes underneath.
   const [latest, setLatest] = useState(task)
   useEffect(() => { setLatest(task) }, [task])
+  // A re-used overlay instance must not carry an edit session across tasks.
+  useEffect(() => { setShowEdit(false) }, [task.id])
   const current = latest
+  const snapshot = controller.getSnapshot()
+  const running = current.status === 'running'
+  const archived = current.archivedAt !== undefined
+  const pending = snapshot.pendingTaskIds.includes(current.id)
+  const transportError = snapshot.transportError
+  const timeZone = snapshot.host?.scheduler.timeZone
 
   return (
     <div className={css.modalBackdrop} onMouseDown={event => { if (event.target === event.currentTarget) controller.closeTask() }}>
       <div className={css.detail} role="dialog" aria-label={t('detail.title')}>
         <header className={css.detailHeader}>
           <h2 className={css.detailTitle}>{current.title}</h2>
-          <span className={css.statusBadge} data-status={current.status}>{t(STATUS_KEY[current.status])}</span>
+          <span className={css.statusBadge} data-status={archived ? 'archived' : current.status}>
+            {archived ? t('board.archive') : t(STATUS_KEY[current.status])}
+          </span>
           <button
             type="button"
             className={css.iconButton}
@@ -193,6 +268,14 @@ export function TaskDetail({ controller, task }: { controller: BoardController; 
         </header>
 
         <div className={css.detailBody}>
+          {transportError !== undefined && (
+            <div className={css.formError}>
+              {t('board.hostError', { error: transportError })}{' '}
+              <button type="button" className={css.linkButton} onClick={() => { void controller.retryHostSync() }}>
+                {t('board.retryHost')}
+              </button>
+            </div>
+          )}
           <section className={css.detailSection}>
             <h4>{t('detail.description')}</h4>
             <p className={css.detailText}>{current.description !== '' ? current.description : '—'}</p>
@@ -203,7 +286,12 @@ export function TaskDetail({ controller, task }: { controller: BoardController; 
             <pre className={css.promptBlock}>{current.prompt !== '' ? current.prompt : current.title}</pre>
           </section>
 
-          <ScheduleSection controller={controller} task={current} />
+          {!archived && (
+            <>
+              <ExecutionSettingsSection controller={controller} task={current} pending={pending} />
+              <ScheduleSection controller={controller} task={current} pending={pending} />
+            </>
+          )}
 
           <section className={css.detailSection}>
             <h4>{t('detail.execution')}</h4>
@@ -215,6 +303,7 @@ export function TaskDetail({ controller, task }: { controller: BoardController; 
                   <ExecutionRow
                     key={execution.id}
                     execution={execution}
+                    timeZone={timeZone}
                     onOpen={sessionId => { controller.openSession(sessionId) }}
                   />
                 ))}
@@ -222,47 +311,88 @@ export function TaskDetail({ controller, task }: { controller: BoardController; 
             )}
           </section>
 
-          <section className={css.detailSection}>
-            <h4>{t('board.status')}</h4>
-            <div className={css.moveRow}>
-              {MANUAL_STATUSES.map(status => (
-                <button
-                  key={status}
-                  type="button"
-                  className={css.ghostButton}
-                  disabled={current.status === status || running}
-                  onClick={() => { controller.moveTask(current.id, status) }}
-                >
-                  {t(`status.move.${status}` as TaskBoardKey)}
-                </button>
-              ))}
-            </div>
-          </section>
+          {!archived && (
+            <section className={css.detailSection}>
+              <h4>{t('board.status')}</h4>
+              <div className={css.moveRow}>
+                {MANUAL_STATUSES.map(status => (
+                  <button
+                    key={status}
+                    type="button"
+                    className={css.ghostButton}
+                    disabled={current.status === status || running || pending}
+                    onClick={() => { controller.moveTask(current.id, status) }}
+                  >
+                    {t(`status.move.${status}` as TaskBoardKey)}
+                  </button>
+                ))}
+              </div>
+            </section>
+          )}
         </div>
 
         <footer className={css.detailFooter}>
-          <button
-            type="button"
-            className={css.primaryButton}
-            disabled={running}
-            onClick={() => {
-              // Running kicks off a real agent session; close the detail so
-              // the whole board stays visible while the task executes.
-              controller.closeTask()
-              void controller.rerunTask(current.id)
-            }}
-          >
-            {current.executions.length === 0 ? t('detail.run') : t('detail.rerun')}
-          </button>
+          {!archived && pending && <span className={css.detailMeta}>{t('board.pending')}…</span>}
+          {!archived && canEditTaskContent(current) && (
+            <button
+              type="button"
+              className={css.ghostButton}
+              disabled={pending}
+              onClick={() => { setShowEdit(true) }}
+            >
+              {t('detail.edit')}
+            </button>
+          )}
+          {!archived && (
+            <button
+              type="button"
+              className={css.primaryButton}
+              disabled={running || pending}
+              onClick={() => {
+                void controller.rerunTask(current.id).then(() => {
+                  if (controller.getSnapshot().transportError === undefined) controller.closeTask()
+                })
+              }}
+            >
+              {current.executions.length === 0 ? t('detail.run') : t('detail.rerun')}
+            </button>
+          )}
+          {archived ? (
+            <button
+              type="button"
+              className={css.primaryButton}
+              disabled={pending}
+              onClick={() => {
+                controller.restoreTask(current.id)
+              }}
+            >
+              {t('detail.restore')}
+            </button>
+          ) : (
+            (current.status === 'done' || current.status === 'failed') && (
+              <button
+                type="button"
+                className={css.ghostButton}
+                disabled={pending}
+                onClick={() => {
+                  controller.archiveTask(current.id)
+                }}
+              >
+                {t('detail.archive')}
+              </button>
+            )
+          )}
           <button
             type="button"
             className={css.dangerButton}
+            disabled={pending}
             onClick={() => { setConfirmDelete(true) }}
           >
             {t('detail.delete')}
           </button>
           <span className={css.detailMeta}>
-            {t('board.created')} {formatTime(current.createdAt)}
+            {t('board.created')} {formatTime(current.createdAt, timeZone)}
+            {archived && ` · ${t('detail.archivedAt', { time: formatTime(current.archivedAt!, timeZone) })}`}
           </span>
         </footer>
       </div>
@@ -277,9 +407,12 @@ export function TaskDetail({ controller, task }: { controller: BoardController; 
           onConfirm={() => {
             setConfirmDelete(false)
             controller.deleteTask(current.id)
-            controller.closeTask()
           }}
         />
+      )}
+
+      {showEdit && !archived && canEditTaskContent(current) && (
+        <EditTaskModal controller={controller} task={current} onClose={() => { setShowEdit(false) }} />
       )}
     </div>
   )

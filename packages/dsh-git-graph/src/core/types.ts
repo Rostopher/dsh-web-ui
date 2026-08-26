@@ -119,10 +119,12 @@ export function parsePorcelain(stdout: string): { dirtyFiles: number; untrackedF
   let dirtyFiles = 0
   let untrackedFiles = 0
   let conflicts = 0
+  // git's porcelain-v1 unmerged codes: DD, AU, UD, UA, DU, AA, UU.
+  const unmerged = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'])
   for (const line of stdout.split('\n')) {
     if (line === '') continue
     const xy = line.slice(0, 2)
-    if (xy.includes('U')) conflicts += 1
+    if (unmerged.has(xy)) conflicts += 1
     else if (xy.startsWith('??')) untrackedFiles += 1
     else dirtyFiles += 1
   }
@@ -154,12 +156,12 @@ export function parseGraph(stdout: string): GraphCommit[] {
   return commits
 }
 
-/** Decoration → ref names: split entries, drop the `HEAD -> ` handoff prefix, drop `tag: `. */
+/** Decoration → ref names: split entries, drop the `HEAD -> ` handoff prefix, drop a bare detached-`HEAD` entry, drop `tag: `. */
 export function parseDecoration(decoration: string): string[] {
   if (decoration === '') return []
   return decoration.split(', ').map(part => {
-    let name = part.replace(/^HEAD -> /, '').replace(/^HEAD,? ?/, '')
-    name = name.replace(/^tag: /, '')
+    if (part === 'HEAD') return ''
+    let name = part.replace(/^HEAD -> /, '').replace(/^tag: /, '')
     return name.trim()
   }).filter(name => name !== '')
 }
@@ -224,4 +226,101 @@ export function computeLanes(rows: readonly GraphCommit[]): GraphRowLanes[] {
     result.push({ columns, nodeColumn, merge: row.parents.length > 1 })
   }
   return result
+}
+
+/**
+ * Runtime narrowing for the wire types served to the browser. Zod is not a
+ * dependency of this package, so each guard is a hand-written structural
+ * check over the same shape the host service produces. The routes boundary
+ * runs these before sending a view so a malformed service output can never
+ * leak to the client as a typed envelope value.
+ * @module dsh-git-graph/core/types
+ */
+
+/** Narrow an unknown value onto {@link RepoStatus}. */
+export function isRepoStatus(value: unknown): value is RepoStatus {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.root === 'string'
+    && typeof record.branch === 'string'
+    && typeof record.head === 'string'
+    && typeof record.dirtyFiles === 'number'
+    && typeof record.untrackedFiles === 'number'
+    && typeof record.conflicts === 'number'
+    && typeof record.operationInProgress === 'boolean'
+}
+
+/** Narrow an unknown value onto {@link BranchRow}. */
+export function isBranchRow(value: unknown): value is BranchRow {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.name === 'string' && typeof record.current === 'boolean'
+}
+
+/** Narrow an unknown value onto {@link BranchesView}. */
+export function isBranchesView(value: unknown): value is BranchesView {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.root === 'string'
+    && typeof record.branch === 'string'
+    && Array.isArray(record.branches) && record.branches.every(isBranchRow)
+    && typeof record.dirtyFiles === 'number'
+    && typeof record.untrackedFiles === 'number'
+    && typeof record.conflicts === 'number'
+    && typeof record.operationInProgress === 'boolean'
+}
+
+/** Narrow an unknown value onto {@link GraphCommit}. */
+export function isGraphCommit(value: unknown): value is GraphCommit {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.oid === 'string'
+    && Array.isArray(record.parents) && record.parents.every(parent => typeof parent === 'string')
+    && typeof record.subject === 'string'
+    && typeof record.author === 'string'
+    && typeof record.authorTime === 'number'
+    && Array.isArray(record.refs) && record.refs.every(ref => typeof ref === 'string')
+}
+
+/** Narrow an unknown value onto {@link GraphView}. */
+export function isGraphView(value: unknown): value is GraphView {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return typeof record.root === 'string'
+    && typeof record.branch === 'string'
+    && Array.isArray(record.commits) && record.commits.every(isGraphCommit)
+    && typeof record.hasMore === 'boolean'
+}
+
+/** The set of stable {@link GitErrorCode} members the client maps onto copy. */
+const GIT_ERROR_CODES = new Set<GitErrorCode>([
+  'conflicts-present',
+  'operation-in-progress',
+  'branch-in-other-worktree',
+  'tracked-changes-would-be-overwritten',
+  'untracked-changes-would-be-overwritten',
+  'target-branch-not-found',
+  'invalid-branch-name',
+  'branch-already-exists',
+  'workspace-unknown',
+  'internal',
+])
+
+/** Narrow an unknown value onto {@link GitErrorCode}. */
+export function isGitErrorCode(value: unknown): value is GitErrorCode {
+  return typeof value === 'string' && GIT_ERROR_CODES.has(value as GitErrorCode)
+}
+
+/** Narrow an unknown value onto {@link GitError}. */
+export function isGitError(value: unknown): value is GitError {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  if (!isGitErrorCode(record.code)) return false
+  if (typeof record.message !== 'string') return false
+  if (record.paths !== undefined
+    && (!Array.isArray(record.paths) || !record.paths.every(path => typeof path === 'string'))) {
+    return false
+  }
+  if (record.moreFiles !== undefined && typeof record.moreFiles !== 'number') return false
+  return true
 }

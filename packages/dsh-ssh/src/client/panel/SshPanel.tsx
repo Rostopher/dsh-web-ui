@@ -8,7 +8,7 @@
 import { useState } from 'react'
 import type { SshApi } from '../api.ts'
 import type { PanelController } from './controller.ts'
-import { tt } from './helpers.ts'
+import { tt, type TerminalFontSource } from './helpers.ts'
 import { ClusterTab } from './ClusterTab.tsx'
 import { HostsTab } from './HostsTab.tsx'
 import { TerminalTab } from './TerminalTab.tsx'
@@ -25,6 +25,8 @@ export interface SshPanelProps {
   controller: PanelController
   /** The SSH API client every tab operates through. */
   api: SshApi
+  /** Live terminal-font setting source handed to the terminal tab (issue #577). */
+  terminalFont?: TerminalFontSource
 }
 
 /** The tab bar definition (labels resolved at render time). */
@@ -43,7 +45,7 @@ interface ConnectRequest {
 }
 
 /** The tabbed SSH panel. */
-export function SshPanel({ controller, api }: SshPanelProps) {
+export function SshPanel({ controller, api, terminalFont }: SshPanelProps) {
   const [activeTab, setActiveTab] = useState<SshTab>('hosts')
   const [connectRequest, setConnectRequest] = useState<ConnectRequest | null>(null)
 
@@ -53,21 +55,31 @@ export function SshPanel({ controller, api }: SshPanelProps) {
   }
 
   return (
-    <div className={css.panel}>
+    <div className={css.panel} data-dsh-plugin="ssh">
       <div className={css.panelHeader}>
+        {/* Shared hook: dsh-web-all offsets center-view back controls beside the collapsed mobile sidebar. */}
+        <button
+          type="button"
+          className={`${css.ghostButton} ${css.backButton}`}
+          aria-label={tt('panel.backToConversation')}
+          data-dsh-center-view-back=""
+          onClick={() => { controller.close() }}
+        >
+          <span aria-hidden="true">‹</span>
+          <span>{tt('panel.backToConversation')}</span>
+        </button>
         <h2 className={css.panelTitle}>{tt('panel.title')}</h2>
-        <button type="button" className={css.iconButton} title={tt('common.close')} aria-label={tt('common.close')} onClick={() => { controller.close() }}>x</button>
       </div>
-      <div className={css.tabBar} role="tablist">
+      <div className={css.tabBar} role="tablist" data-dsh-part="tab-bar">
         {TABS.map(tab => (
-          <button key={tab.id} type="button" role="tab" aria-selected={activeTab === tab.id} data-active={activeTab === tab.id ? '' : undefined} className={css.tab} onClick={() => { setActiveTab(tab.id) }}>
+          <button key={tab.id} type="button" role="tab" aria-selected={activeTab === tab.id} data-active={activeTab === tab.id ? '' : undefined} data-dsh-part="tab" className={css.tab} onClick={() => { setActiveTab(tab.id) }}>
             {tab.label()}
           </button>
         ))}
       </div>
       <div className={css.panelContent}>
         {activeTab === 'hosts' && <HostsTab api={api} onConnect={handleConnect} />}
-        {activeTab === 'terminal' && <TerminalTab api={api} presetAlias={connectRequest?.alias} requestId={connectRequest?.nonce} />}
+        {activeTab === 'terminal' && <TerminalTab api={api} presetAlias={connectRequest?.alias} requestId={connectRequest?.nonce} terminalFont={terminalFont} />}
         {activeTab === 'transfer' && <TransferTab api={api} />}
         {activeTab === 'tunnels' && <TunnelsTab api={api} />}
         {activeTab === 'cluster' && <ClusterTab api={api} />}

@@ -125,7 +125,90 @@ describe('nextRunAtMs', () => {
     expect(nextRunAtMs('0 0 30 2 *', at(2026, 1, 1, 0, 0))).toBeUndefined()
   })
 
+  it('finds a leap-day occurrence beyond the old one-year scan horizon', () => {
+    expect(nextRunAtMs('0 0 29 2 *', at(2025, 3, 1, 0, 0))).toBe(at(2028, 2, 29, 0, 0))
+  })
+
   it('returns undefined for invalid expressions', () => {
     expect(nextRunAtMs('not a cron', at(2026, 1, 1, 0, 0))).toBeUndefined()
   })
+
+  it('matches an independent day-granular reference across sparse and dense schedules', () => {
+    const crons = [
+      '* * * * *',
+      '*/5 * * * *',
+      '0 9 * * *',
+      '0 9 * * 1',
+      '0 9 15 * 1',
+      '0 9 1-31 * 1',
+      '0 0 1 * *',
+      '30 2 * * *',
+      '0 0 29 2 *',
+      '0 0 31 12 *',
+      '15 8-18/3 * * *',
+      '0 9 * 2 1',
+      '0 0 1 */2 *',
+      '0 0 30 2 *',
+    ]
+    const froms = [
+      at(2026, 1, 1, 0, 0),
+      at(2026, 1, 1, 10, 30),
+      at(2026, 6, 15, 12, 0),
+      at(2025, 3, 1, 0, 0),
+      at(2026, 12, 31, 23, 59),
+      at(2027, 2, 28, 23, 59),
+    ]
+    for (const expr of crons) {
+      for (const fromMs of froms) {
+        expect(nextRunAtMs(expr, fromMs), `${expr} from ${new Date(fromMs).toISOString()}`).toBe(referenceNextRunAtMs(expr, fromMs))
+      }
+    }
+  })
 })
+
+/**
+ * Independent fast behavioural reference: walks calendar days inside the
+ * same five-year horizon (never scanning minutes), and for each matching day
+ * picks the earliest matching hour/minute strictly after `fromMs`. Wall-clock
+ * field construction plus the hour/minute re-check reproduce the production
+ * implementation's DST semantics without sharing its control flow, so the
+ * two implementations still cross-check each other.
+ */
+function referenceNextRunAtMs(expr: string, fromMs: number): number | undefined {
+  const schedule = parseCron(expr)
+  if (schedule === null) return undefined
+  if (!schedule.dayWildcard && schedule.weekdayWildcard) {
+    const maximumDay = new Map<number, number>([
+      [1, 31], [2, 29], [3, 31], [4, 30], [5, 31], [6, 30],
+      [7, 31], [8, 31], [9, 30], [10, 31], [11, 30], [12, 31],
+    ])
+    const possible = [...schedule.months].some(month => [...schedule.days].some(day => day <= (maximumDay.get(month) ?? 0)))
+    if (!possible) return undefined
+  }
+  const from = new Date(fromMs)
+  const limitMs = fromMs + 5 * 366 * 24 * 60 * 60 * 1000
+  const hours = [...schedule.hours].sort((a, b) => a - b)
+  const minutes = [...schedule.minutes].sort((a, b) => a - b)
+  const start = new Date(from.getFullYear(), from.getMonth(), from.getDate(), 0, 0, 0, 0)
+  for (let offset = 0; ; offset += 1) {
+    const day = new Date(start.getFullYear(), start.getMonth(), start.getDate() + offset, 0, 0, 0, 0)
+    if (day.getTime() > limitMs) return undefined
+    if (!schedule.months.has(day.getMonth() + 1)) continue
+    const dayMatches = schedule.days.has(day.getDate())
+    const weekdayMatches = schedule.weekdays.has(day.getDay())
+    const matchesDay = schedule.dayWildcard ? weekdayMatches : schedule.weekdayWildcard ? dayMatches : dayMatches || weekdayMatches
+    if (!matchesDay) continue
+    for (const hour of hours) {
+      for (const minute of minutes) {
+        const candidate = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hour, minute, 0, 0)
+        // Wall-clock re-check: a nonexistent spring-forward time normalizes
+        // forward, so the constructed fields must equal the intended ones.
+        if (candidate.getHours() !== hour || candidate.getMinutes() !== minute) continue
+        const time = candidate.getTime()
+        if (time <= fromMs) continue
+        if (time > limitMs) return undefined
+        return time
+      }
+    }
+  }
+}

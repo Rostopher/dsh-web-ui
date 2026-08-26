@@ -1,6 +1,6 @@
 /** foldEvents: message-list folding from a session event stream. */
 import { describe, expect, it } from 'vitest'
-import { foldEvents, latestContextWindow, type WireEvent } from './messages.ts'
+import { EventFolder, foldEvents, type WireEvent } from './messages.ts'
 
 /** Assemble one event with an auto-incrementing seq / time. */
 function makeEvent(
@@ -183,22 +183,27 @@ describe('foldEvents', () => {
     expect(assistant?.pending).toBeFalsy()
   })
 
-  it('keeps per-step order after turn/end (regression: turn/end must not rewrite seq)', () => {
-    // Mirrors a real multi-step turn: each step's final assistant/message is
-    // followed by its tool calls; turn/end closes the turn last. turn/end
-    // used to bump every assistant message of the turn to its own seq, which
-    // equalized every sort key and left the final order to the lexicographic
-    // id tie-break — the final answer could surface above its own tool steps.
-    const events: WireEvent[] = [
-      makeEvent('user/message', userMessageData('u-1', 'hello'), 100),
-      makeEvent('assistant/message', assistantMessageData('z-1', 1, 1, '第一步'), 110),
-      makeEvent('tool/call', { turn: 1, step: 1, callId: 'c1', name: 'glob', arguments: '{}' }, 111),
-      makeEvent('assistant/message', assistantMessageData('m-2', 1, 2, ''), 120),
-      makeEvent('tool/call', { turn: 1, step: 2, callId: 'c2', name: 'read', arguments: '{}' }, 121),
-      makeEvent('assistant/message', assistantMessageData('a-3', 1, 3, '最终答案'), 130),
-      makeEvent('turn/end', { turn: 1, reason: { kind: 'completed' } }, 140),
-    ]
-    expect(foldEvents(events).map(message => message.id)).toEqual(['u-1', 'z-1', 'm-2', 'a-3'])
+  it('keeps same-turn steps in final-event order after turn/end', () => {
+    const result = foldEvents([
+      makeEvent('user/message', userMessageData('u-1', 'multi-step'), 0),
+      makeEvent('assistant/message', assistantMessageData('step-z', 0, 0, 'first'), 2),
+      makeEvent('assistant/message', assistantMessageData('step-a', 0, 1, 'second'), 4),
+      makeEvent('assistant/message', assistantMessageData('step-m', 0, 2, 'third'), 6),
+      makeEvent('turn/end', { turn: 0, reason: { kind: 'completed' } }, 7),
+    ])
+
+    const assistants = result.filter(message => message.kind === 'assistant')
+    expect(assistants.map(message => message.id)).toEqual(['step-z', 'step-a', 'step-m'])
+    expect(assistants.map(message => message.seq)).toEqual([2, 4, 6])
+    expect(assistants.every(message => message.pending !== true)).toBe(true)
+  })
+
+  it('keeps stable insertion order when legacy rows share a seq', () => {
+    const folder = new EventFolder([
+      { id: 'z-last-lexically', kind: 'assistant', text: 'first', seq: 5, time: 5_000 },
+      { id: 'a-first-lexically', kind: 'assistant', text: 'second', seq: 5, time: 5_000 },
+    ])
+    expect(folder.snapshot().map(message => message.id)).toEqual(['z-last-lexically', 'a-first-lexically'])
   })
 
   it('is idempotent: applying the same batch twice yields an identical list', () => {
@@ -238,40 +243,160 @@ describe('foldEvents', () => {
     expect(JSON.stringify(first)).toBe(snapshot)
   })
 
-  it('marks host-injected user-role messages with their source kind', () => {
-    const events: WireEvent[] = [
-      makeEvent('user/message', userMessageData('u-1', 'hello'), 0),
-      makeEvent('user/message', {
-        id: 'sys-1',
-        role: 'user',
-        content: [{ type: 'text', text: 'workspace instructions' }],
-        source: { kind: 'agent-instructions' },
-      }, 1),
-    ]
-    const result = foldEvents(events)
-    expect(result).toHaveLength(2)
-    expect(result[0]?.sourceKind).toBeUndefined()
-    expect(result[1]).toMatchObject({ id: 'sys-1', kind: 'user', sourceKind: 'agent-instructions' })
-  })
-
-  it('keeps the final usage on the assistant message and tracks the context window', () => {
+  it('request/context sets the context window used by a later assistant/message with usage', () => {
     const events: WireEvent[] = [
       makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 100_000 }, 0),
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 1),
       makeEvent('assistant/message', {
         turn: 0,
         step: 0,
-        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'done' }] },
-        usage: { inputTokens: 1200, outputTokens: 80, cacheReadTokens: 3000 },
-      }, 1),
-      makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 200_000 }, 2),
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }, 2),
     ]
     const result = foldEvents(events)
+    const assistant = result.find(message => message.kind === 'assistant')
+    expect(assistant).toMatchObject({
+      usage: { inputTokens: 10, outputTokens: 5 },
+      contextWindow: 100_000,
+    })
+  })
+
+  it('usage without a context window carries no contextWindow', () => {
+    const events: WireEvent[] = [
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 0),
+      makeEvent('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }, 1),
+    ]
+    const result = foldEvents(events)
+    const assistant = result.find(message => message.kind === 'assistant')
+    expect(assistant).toMatchObject({ usage: { inputTokens: 10, outputTokens: 5 } })
+    expect(assistant?.contextWindow).toBeUndefined()
+  })
+
+  it('usage and contextWindow are both attached when request/context precedes the message', () => {
+    const events: WireEvent[] = [
+      makeEvent('request/context', { provider: 'fx', model: 'fx-1', contextWindow: 200_000 }, 0),
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 1),
+      makeEvent('assistant/message', {
+        turn: 0,
+        step: 0,
+        message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        usage: { inputTokens: 30, outputTokens: 2, cacheReadTokens: 8, cacheWriteTokens: 1 },
+      }, 2),
+    ]
+    const result = foldEvents(events)
+    const assistant = result.find(message => message.kind === 'assistant')
+    expect(assistant).toMatchObject({
+      usage: { inputTokens: 30, outputTokens: 2, cacheReadTokens: 8, cacheWriteTokens: 1 },
+      contextWindow: 200_000,
+    })
+  })
+
+  it('assistant/message without usage has no usage field', () => {
+    const events: WireEvent[] = [
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 0),
+      makeEvent('assistant/message', { turn: 0, step: 0, message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }, 1),
+    ]
+    const result = foldEvents(events)
+    const assistant = result.find(message => message.kind === 'assistant')
+    expect(assistant?.usage).toBeUndefined()
+    expect(assistant?.contextWindow).toBeUndefined()
+  })
+
+  it('attaches sourceKind from source.kind for a user message', () => {
+    const events: WireEvent[] = [
+      makeEvent('user/message', {
+        id: 'u-plugin',
+        role: 'user',
+        content: [{ type: 'text', text: '系统注入' }],
+        source: { kind: 'plugin', name: 'react-extension' },
+      }, 0),
+    ]
+    const result = foldEvents(events)
+    expect(result[0]).toMatchObject({ id: 'u-plugin', kind: 'user', sourceKind: 'plugin' })
+  })
+
+  it('keeps sourceKind on a replayed/replaced user/message', () => {
+    const first = foldEvents([makeEvent('user/message', {
+      id: 'u-1',
+      role: 'user',
+      content: [{ type: 'text', text: '第一版' }],
+      source: { kind: 'plugin' },
+    }, 0)])
+    const second = foldEvents([makeEvent('user/message', {
+      id: 'u-1',
+      role: 'user',
+      content: [{ type: 'text', text: '第二版' }],
+      source: { kind: 'plugin' },
+    }, 1)], first)
+    expect(second[0]).toMatchObject({ id: 'u-1', text: '第二版', sourceKind: 'plugin' })
+  })
+
+  it('request/context and unknown events are still ignored by the fold', () => {
+    const events: WireEvent[] = [
+      makeEvent('some/future-event', { nope: true }, 0),
+      makeEvent('request/context', { provider: 'fx', model: 'fx-1' }, 1),
+      makeEvent('user/message', userMessageData('u-1', '真实消息'), 2),
+    ]
+    const result = foldEvents(events)
+    // request/context with no window and the unknown event render nothing.
     expect(result).toHaveLength(1)
-    expect(result[0]?.usage).toEqual({ inputTokens: 1200, cacheReadTokens: 3000, cacheWriteTokens: 0 })
-    // The newest advertisement wins; an older page cannot roll it back.
-    const tracked = latestContextWindow(events)
-    expect(tracked).toEqual({ window: 200_000, seq: 2 })
-    const olderPage: WireEvent[] = [events[0] as WireEvent]
-    expect(latestContextWindow(olderPage, tracked)).toEqual({ window: 200_000, seq: 2 })
+    expect(result[0]).toMatchObject({ id: 'u-1', kind: 'user' })
+  })
+})
+
+describe('EventFolder incremental folding', () => {
+  it('matches a one-shot fold when events arrive one at a time', () => {
+    const stream: WireEvent[] = [
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 0),
+      textChunk(0, 0, '你', 1),
+      textChunk(0, 0, '好', 2),
+      makeEvent('assistant/message', assistantMessageData('a-1', 0, 0, '你好'), 3),
+      makeEvent('message/update', { id: 'u-1', text: '更新' }, 4),
+    ]
+    const oneShot = foldEvents(stream)
+    const folder = new EventFolder()
+    let incremental: ReturnType<typeof foldEvents> = []
+    for (const event of stream) incremental = folder.fold([event])
+    expect(incremental).toEqual(oneShot)
+  })
+
+  it('replays and re-folds are no-ops and reuse the previous snapshot identity', () => {
+    const folder = new EventFolder(foldEvents([
+      makeEvent('user/message', userMessageData('u-1', 'hi'), 0),
+      textChunk(0, 0, '你', 1),
+    ]))
+    const first = folder.fold([textChunk(0, 0, '好', 2)])
+    expect(first[first.length - 1]).toMatchObject({ text: '你好', pending: true })
+    // Same event again (wire replay or a double-invoked state updater): no change, same identity.
+    const replay = folder.fold([textChunk(0, 0, '好', 2)])
+    expect(replay).toBe(first)
+    // A no-op batch over an already folded stream also keeps the identity.
+    expect(folder.fold([])).toBe(first)
+  })
+
+  it('prepends older pages and keeps folding live events on top', () => {
+    const folder = new EventFolder(foldEvents([
+      makeEvent('user/message', userMessageData('u-2', '第二页'), 10),
+    ]))
+    folder.prepend(foldEvents([makeEvent('user/message', userMessageData('u-1', '第一页'), 5)]))
+    const withLive = folder.fold([textChunk(0, 0, '新', 11)])
+    expect(withLive.map(message => message.id)).toEqual(['u-1', 'u-2', 'assistant,0.0#11'])
+    // The live fold must not lose the prepended rows on later events.
+    const later = folder.fold([textChunk(0, 0, '续', 12)])
+    expect(later.map(message => message.id)).toEqual(['u-1', 'u-2', 'assistant,0.0#11'])
+    expect(later[2]).toMatchObject({ text: '新续', pending: true })
+  })
+
+  it('seed replaces the whole stream', () => {
+    const folder = new EventFolder(foldEvents([makeEvent('user/message', userMessageData('u-1', '旧'), 0)]))
+    folder.seed(foldEvents([makeEvent('user/message', userMessageData('u-2', '新'), 5)]))
+    expect(folder.snapshot().map(message => message.id)).toEqual(['u-2'])
+    expect(folder.fold([textChunk(0, 0, '追加', 6)]).map(message => message.id)).toEqual(['u-2', 'assistant,0.0#6'])
   })
 })

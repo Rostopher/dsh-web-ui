@@ -3,7 +3,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
-  canMoveManually, createTask, executionLabel, settleExecution, startExecution, withSchedule, withStatus,
+  canMoveManually, createTask, EXECUTION_HISTORY_LIMIT, executionLabel, retainRecentExecutions,
+  settleExecution, startExecution, withSchedule, withStatus,
 } from '../src/core/tasks.ts'
 
 const NOW = 1_700_000_000_000
@@ -33,6 +34,37 @@ describe('createTask', () => {
     expect(task.id).toBe('task-2')
     expect(task.description).toBe('')
     expect(task.prompt).toBe('')
+    expect(task.workspaceId).toBeUndefined()
+    expect(task.mode).toBeUndefined()
+    expect(task.permission).toBeUndefined()
+  })
+
+  it('carries the execution targets and collapses blank ones', () => {
+    const task = createTask(
+      { title: 'x', description: '', prompt: '', workspaceId: '  ws-1  ', mode: 'anchored', permission: 'danger-full-access' },
+      NOW,
+      'task-3',
+    )
+    expect(task.workspaceId).toBe('ws-1')
+    expect(task.mode).toBe('anchored')
+    expect(task.permission).toBe('danger-full-access')
+    const blank = createTask(
+      { title: 'x', description: '', prompt: '', workspaceId: '   ', mode: '', permission: undefined },
+      NOW,
+      'task-4',
+    )
+    expect(blank.workspaceId).toBeUndefined()
+    expect(blank.mode).toBeUndefined()
+    expect(blank.permission).toBeUndefined()
+  })
+
+  it('drops unknown permission strings', () => {
+    const task = createTask(
+      { title: 'x', description: '', prompt: '', permission: 'root' as never },
+      NOW,
+      'task-5',
+    )
+    expect(task.permission).toBeUndefined()
   })
 })
 
@@ -65,7 +97,7 @@ describe('status transitions', () => {
 
 describe('settleExecution', () => {
   it('settles a run as done on success', () => {
-    const { task, execution } = startExecution(sampleTask(), NOW, 'exec-1')
+    const { task } = startExecution(sampleTask(), NOW, 'exec-1')
     const settled = settleExecution(task, 'exec-1', 'succeeded', NOW + 10, undefined)
     expect(settled.status).toBe('done')
     expect(settled.executions[0].endedAt).toBe(NOW + 10)
@@ -74,7 +106,7 @@ describe('settleExecution', () => {
   })
 
   it('settles a run as failed on failure', () => {
-    const { task, execution } = startExecution(sampleTask(), NOW, 'exec-1')
+    const { task } = startExecution(sampleTask(), NOW, 'exec-1')
     const settled = settleExecution(task, 'exec-1', 'failed', NOW + 10, 'boom')
     expect(settled.status).toBe('failed')
     expect(settled.executions[0].result).toBe('failed')
@@ -82,14 +114,14 @@ describe('settleExecution', () => {
   })
 
   it('cancelled runs return a non-running task to todo', () => {
-    const { task, execution } = startExecution(sampleTask(), NOW, 'exec-1')
+    const { task } = startExecution(sampleTask(), NOW, 'exec-1')
     const settled = settleExecution(task, 'exec-1', 'cancelled', NOW + 10, 'interrupted')
     expect(settled.status).toBe('todo')
     expect(settled.executions[0].result).toBe('cancelled')
   })
 
   it('is a no-op for unknown or already-settled executions', () => {
-    const { task, execution } = startExecution(sampleTask(), NOW, 'exec-1')
+    const { task } = startExecution(sampleTask(), NOW, 'exec-1')
     expect(settleExecution(task, 'nope', 'succeeded', NOW + 1, undefined)).toBe(task)
     const settled = settleExecution(task, 'exec-1', 'succeeded', NOW + 1, undefined)
     // Second settle with the same id does not overwrite the outcome.
@@ -107,6 +139,55 @@ describe('settleExecution', () => {
     expect(settled.executions).toHaveLength(2)
     expect(settled.executions[0].result).toBeUndefined()
     expect(settled.executions[1].result).toBe('succeeded')
+  })
+})
+
+describe('execution history retention', () => {
+  it('trims the oldest run when a 21st execution starts', () => {
+    let task = sampleTask()
+    for (let i = 1; i <= EXECUTION_HISTORY_LIMIT; i += 1) {
+      const started = startExecution(task, NOW + i, `exec-${i}`)
+      task = settleExecution(started.task, `exec-${i}`, 'succeeded', NOW + i + 1, undefined)
+    }
+    const opened = startExecution(task, NOW + EXECUTION_HISTORY_LIMIT + 1, `exec-${EXECUTION_HISTORY_LIMIT + 1}`)
+    expect(opened.task.executions).toHaveLength(EXECUTION_HISTORY_LIMIT)
+    expect(opened.task.executions[0].id).toBe('exec-2')
+    expect(opened.task.executions.at(-1)?.id).toBe(`exec-${EXECUTION_HISTORY_LIMIT + 1}`)
+    expect(opened.task.executions.at(-1)?.endedAt).toBeUndefined()
+  })
+
+  it('trims only settled history, never the running execution', () => {
+    const settled = Array.from({ length: EXECUTION_HISTORY_LIMIT + 5 }, (_, index) => ({
+      id: `settled-${index}`,
+      sessionId: `session-${index}`,
+      startedAt: index,
+      endedAt: index + 1,
+      result: 'succeeded' as const,
+      error: undefined,
+    }))
+    const running = {
+      id: 'running',
+      sessionId: 'session-open',
+      startedAt: EXECUTION_HISTORY_LIMIT + 10,
+      endedAt: undefined,
+      result: undefined,
+      error: undefined,
+    }
+    const kept = retainRecentExecutions([...settled, running])
+    expect(kept).toHaveLength(EXECUTION_HISTORY_LIMIT)
+    expect(kept.at(-1)?.id).toBe('running')
+    expect(kept.at(-1)?.endedAt).toBeUndefined()
+    expect(kept.slice(0, -1).map(entry => entry.id)).toEqual(
+      Array.from({ length: EXECUTION_HISTORY_LIMIT - 1 }, (_, index) => `settled-${index + 6}`),
+    )
+  })
+
+  it('copies lists within the limit without reordering', () => {
+    const { task } = startExecution(sampleTask(), NOW, 'exec-1')
+    const kept = retainRecentExecutions(task.executions)
+    expect(kept).toHaveLength(1)
+    expect(kept[0].id).toBe('exec-1')
+    expect(kept).not.toBe(task.executions)
   })
 })
 

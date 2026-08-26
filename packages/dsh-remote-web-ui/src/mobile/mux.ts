@@ -39,9 +39,9 @@ export interface MuxClientOptions {
    * the ordinary HTTP channel (unaffected by SSE-impairing tunnels).
    */
   pollLatest?: (sessionId: string) => Promise<HistoryPage>
-  /** Poll cadence while SSE is stalled (default 3000 ms). */
+  /** Initial poll cadence while SSE is stalled (default 3000 ms). Empty polls back off to 60000 ms. */
   pollIntervalMs?: number
-  /** How long SSE must go without a frame before fallback kicks in (default 12000 ms). */
+  /** Initial SSE stall window (default 12000 ms); a previously-live stream gets three windows before fallback. */
   stallThresholdMs?: number
   /** Clock seam for tests (defaults to Date.now). */
   now?: () => number
@@ -66,6 +66,14 @@ type SessionEventFrame = Extract<MuxFrame, { type: 'session/event' }>
 
 const DEFAULT_POLL_INTERVAL_MS = 3000
 const DEFAULT_STALL_THRESHOLD_MS = 12000
+const LIVE_SSE_STALL_MULTIPLIER = 3
+const MAX_POLL_BACKOFF_MS = 60000
+/**
+ * Stall-check granularity: the single scheduler tick runs at least this
+ * often so fallback arms within a second of the stall threshold passing,
+ * while the poll cadence itself stays {@link MuxClientOptions.pollIntervalMs}.
+ */
+const STALL_CHECK_MS = 1000
 /** Poll window: enough recent events to cover a few seconds of agent output. */
 const DEFAULT_POLL_PAGE_SIZE = 50
 
@@ -92,15 +100,19 @@ export class MuxClient {
   private lastDataAt = 0
   /**
    * Whether the SSE channel has ever delivered a frame in this stream (a
-   * delivered frame proves the tunnel forwards SSE; silence alone then means
-   * the agent idle, not a dead channel — only an onerror re-arms fallback).
+   * delivered frame proves the tunnel can forward SSE; sustained silence may
+   * still mean a suspended mobile tunnel, so polling re-arms after 3 windows).
    */
   private sseAlive = false
   /** Per-session highest event seq already emitted, for poll dedup. */
   private readonly pollWatermark = new Map<string, number>()
-  private stallTimer: ReturnType<typeof setInterval> | undefined
-  private pollTimer: ReturnType<typeof setInterval> | undefined
+  /** Single scheduler tick: both the stall check and the poll cadence ride this one interval. */
+  private tickTimer: ReturnType<typeof setInterval> | undefined
   private polling = false
+  /** Epoch ms of the next due poll while polling (kept on the same tick timer). */
+  private nextPollAt = 0
+  /** Adaptive delay: productive polls reset it; empty/error polls add one base interval up to one minute. */
+  private pollDelayMs: number
 
   /**
    * @param url - the mobile events endpoint (browser-relative).
@@ -111,6 +123,7 @@ export class MuxClient {
     this.sourceFactory = options.sourceFactory ?? browserSource
     this.pollLatest = options.pollLatest ?? ((sessionId) => fetchHistory(sessionId, undefined, DEFAULT_POLL_PAGE_SIZE))
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+    this.pollDelayMs = this.pollIntervalMs
     this.stallThresholdMs = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS
     this.now = options.now ?? (() => Date.now())
   }
@@ -120,16 +133,17 @@ export class MuxClient {
     this.stopped = false
     this.lastDataAt = this.now()
     if (this.source === undefined) this.connect()
-    this.startStallChecker()
+    this.startTick()
   }
 
   /** Close for good. */
   stop(): void {
     this.stopped = true
-    this.stopStallChecker()
+    this.stopTick()
     this.stopPolling()
     this.closeSource()
     this.observeSessionId = undefined
+    this.nextPollAt = 0
   }
 
   /** Subscribe to validated frames; returns an unsubscribe function. */
@@ -150,9 +164,7 @@ export class MuxClient {
       return
     }
     // If SSE is already stalled for this session, start patching right away.
-    if (!this.polling && !this.stopped && !this.sseAlive && (this.now() - this.lastDataAt) > this.stallThresholdMs) {
-      this.startPolling()
-    }
+    if (!this.polling && !this.stopped && this.isSseStalled()) this.startPolling()
   }
 
   private connect(): void {
@@ -176,40 +188,60 @@ export class MuxClient {
     }
   }
 
-  private startStallChecker(): void {
-    this.stopStallChecker()
-    this.stallTimer = setInterval(() => {
-      if (this.stopped) return
-      if (this.observeSessionId === undefined) return
-      if (this.polling) return
-      // A live SSE channel only goes silent while the agent idles; never
-      // poll against it. Fallback arms again only via onerror or a stream
-      // that has never delivered.
-      if (this.sseAlive) return
-      if ((this.now() - this.lastDataAt) > this.stallThresholdMs) this.startPolling()
-    }, 1000)
+  /**
+   * The single scheduler tick is the only interval this client owns. One
+   * timer (at the finer of the stall-check and poll cadences) both arms the
+   * polling fallback once the stall threshold passes and drives each poll at
+   * {@link MuxClientOptions.pollIntervalMs} — one timer instead of two.
+   */
+  private startTick(): void {
+    if (this.tickTimer !== undefined) return
+    const cadence = Math.min(this.pollIntervalMs, STALL_CHECK_MS)
+    this.tickTimer = setInterval(() => { this.tick() }, cadence)
   }
 
-  private stopStallChecker(): void {
-    if (this.stallTimer !== undefined) {
-      clearInterval(this.stallTimer)
-      this.stallTimer = undefined
+  private stopTick(): void {
+    if (this.tickTimer !== undefined) {
+      clearInterval(this.tickTimer)
+      this.tickTimer = undefined
     }
+  }
+
+  private tick(): void {
+    if (this.stopped) return
+    if (this.observeSessionId === undefined) return
+    if (this.polling) {
+      // The stall phase has ended; the same tick now paces the adaptive polls.
+      if (this.now() >= this.nextPollAt) {
+        // pollTick schedules the next run after it settles, so slow requests
+        // cannot overlap with another scheduler tick.
+        this.nextPollAt = Number.POSITIVE_INFINITY
+        void this.pollTick()
+      }
+      return
+    }
+    if (this.isSseStalled()) this.startPolling()
+  }
+
+  private isSseStalled(): boolean {
+    const windowMs = this.sseAlive
+      ? this.stallThresholdMs * LIVE_SSE_STALL_MULTIPLIER
+      : this.stallThresholdMs
+    return (this.now() - this.lastDataAt) > windowMs
   }
 
   private startPolling(): void {
     if (this.polling || this.stopped) return
     this.polling = true
+    this.pollDelayMs = this.pollIntervalMs
+    this.nextPollAt = Number.POSITIVE_INFINITY
     void this.pollTick()
-    this.pollTimer = setInterval(() => { void this.pollTick() }, this.pollIntervalMs)
   }
 
   private stopPolling(): void {
     this.polling = false
-    if (this.pollTimer !== undefined) {
-      clearInterval(this.pollTimer)
-      this.pollTimer = undefined
-    }
+    this.pollDelayMs = this.pollIntervalMs
+    this.nextPollAt = 0
   }
 
   /**
@@ -223,19 +255,35 @@ export class MuxClient {
       this.stopPolling()
       return
     }
+    let emitted = 0
     try {
       const page = await this.pollLatest(sessionId)
       let maxSeq = this.pollWatermark.get(sessionId) ?? -1
-      for (const entry of page.events) {
+      const ordered = [...page.events].sort((left, right) => {
+        const leftSeq = typeof left.event?.seq === 'number' ? left.event.seq : -1
+        const rightSeq = typeof right.event?.seq === 'number' ? right.event.seq : -1
+        return leftSeq - rightSeq
+      })
+      for (const entry of ordered) {
         const event = entry.event
         const seq = typeof event?.seq === 'number' ? event.seq : -1
         if (seq <= maxSeq) continue
         maxSeq = seq
+        emitted += 1
         this.emit({ type: 'session/event', sessionId: sessionId as SessionEventFrame['sessionId'], event } as SessionEventFrame)
       }
       this.pollWatermark.set(sessionId, maxSeq)
     } catch {
-      // Transient (network, pairing, history paging); the next tick retries.
+      // Transient (network, pairing, history paging); retry with backoff.
+    } finally {
+      if (emitted > 0) {
+        this.pollDelayMs = this.pollIntervalMs
+      } else {
+        this.pollDelayMs = Math.min(MAX_POLL_BACKOFF_MS, this.pollDelayMs + this.pollIntervalMs)
+      }
+      if (this.polling && this.observeSessionId === sessionId) {
+        this.nextPollAt = this.now() + this.pollDelayMs
+      }
     }
   }
 

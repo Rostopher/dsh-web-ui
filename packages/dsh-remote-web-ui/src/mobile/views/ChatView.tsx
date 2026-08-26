@@ -11,15 +11,15 @@
  *   permission pickers, both as bottom sheets.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { MuxFrame } from '@deepseek-ai/dsh-host-apiproxy/api/events'
 import type { SessionModels } from '@deepseek-ai/dsh-host-apiproxy/api/sessions'
 import { loadHistory, prompt, type SessionView } from './App.tsx'
 import { errorText, formatTime, staleHostHint } from './App.tsx'
-import { fetchMobilePreferences, models, selectModel, sendCommand } from '../api.ts'
-import { getDisplayOptions, setDisplayOptions, subscribeDisplayOptions } from '../display-options.ts'
+import { fetchMobilePreferences, models, selectModel, sendCommand, cancelSession, fetchPending, respondApproval, respondQuestion } from '../api.ts'
+import type { PendingApproval, PendingQuestionItem } from '../api.ts'
+import { EventFolder, foldEvents, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { renderMarkdown } from '../markdown.ts'
-import { foldEvents, latestContextWindow, type ContextWindow, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { MuxClient } from '../mux.ts'
 import { ThemeToggle } from '../theme-toggle.tsx'
 
@@ -37,6 +37,31 @@ export interface ChatViewProps {
  * history tail re-pull closes the seam.
  */
 export const MAX_TAIL_BUFFER_EVENTS = 500
+
+/** localStorage key for the tool-call display toggle (persisted on the /m origin). */
+const SHOW_TOOL_CALLS_KEY = 'dsh.mobile.showToolCalls'
+/** localStorage key for the injected-system-message display toggle. */
+const SHOW_SYSTEM_MESSAGES_KEY = 'dsh.mobile.showSystemMessages'
+
+/** Read a boolean from localStorage defensively; falls back to the default. */
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key)
+    if (raw === null) return fallback
+    return raw === '1' || raw.toLowerCase() === 'true'
+  } catch {
+    return fallback
+  }
+}
+
+/** Persist a boolean toggle; storage failures are ignored (feature stays non-persistent). */
+function writeStoredBoolean(key: string, value: boolean): void {
+  try {
+    localStorage.setItem(key, value ? '1' : '0')
+  } catch {
+    /* quota / privacy mode: non-persistent is acceptable */
+  }
+}
 
 /** Extract the raw event from one history entry (the fold consumes events only). */
 function eventOf(entry: { event: WireEvent }): WireEvent {
@@ -120,6 +145,8 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const tailLoadingRef = useRef(true)
   /** Live session events buffered while the initial tail page loads. */
   const liveBufferRef = useRef<WireEvent[]>([])
+  /** Incremental folder for this session's stream (indexes stay hot across events). */
+  const folderRef = useRef<EventFolder | undefined>(undefined)
   /** True once the live buffer hit its cap (oldest events were dropped). */
   const liveBufferOverflowRef = useRef(false)
 
@@ -129,15 +156,23 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
   const [currentModel, setCurrentModel] = useState<{ provider: string; model: string; reasoningEffort?: string } | undefined>(undefined)
   /** Which bottom sheet is open. */
   const [sheet, setSheet] = useState<'model' | 'permission' | 'display' | null>(null)
-  /** Chat display options (tool disclosures, host-injected messages). */
-  const displayOptions = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
-  /** The session's advertised context window (latest request/context wins). */
-  const [contextWindow, setContextWindow] = useState<ContextWindow | undefined>(undefined)
+  /** Show tool-call disclosures (default on, persisted on the /m origin). */
+  const [showToolCalls, setShowToolCalls] = useState<boolean>(() => readStoredBoolean(SHOW_TOOL_CALLS_KEY, true))
+  /** Show injected system messages (default off, persisted on the /m origin). */
+  const [showSystemMessages, setShowSystemMessages] = useState<boolean>(() => readStoredBoolean(SHOW_SYSTEM_MESSAGES_KEY, false))
   /**
    * Composer preference from the plugin's host settings (default true keeps
    * the legacy Enter-to-send behavior until the preference loads).
    */
   const [mobileEnterToSend, setMobileEnterToSend] = useState(true)
+  /** Whether the assistant is currently generating (turn/start..turn/end). */
+  const [running, setRunning] = useState(false)
+  /** Whether a stop request is in flight (guards the composer's stop button). */
+  const [stopping, setStopping] = useState(false)
+  /** Pending tool approvals awaiting user decision (#1025). */
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([])
+  /** Pending questions awaiting user answer (#1025). */
+  const [pendingQuestions, setPendingQuestions] = useState<PendingQuestionItem[]>([])
 
   // Read-only mobile display preferences ride the plugin's local
   // `/m/api` method; a failure keeps the default (Enter sends).
@@ -164,10 +199,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     tailLoadingRef.current = true
     liveBufferRef.current = []
     liveBufferOverflowRef.current = false
+    folderRef.current = undefined
     setLoading(true)
     setError(undefined)
     setMessages([])
-    setContextWindow(undefined)
     void loadHistory(session.sessionId, undefined, controller.signal).then(
       (page) => {
         if (cancelled) return
@@ -176,9 +211,9 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         const buffered = liveBufferRef.current
         liveBufferRef.current = []
         tailLoadingRef.current = false
-        const pageEvents = page.events.map(eventOf)
-        setMessages(foldEvents(buffered, foldEvents(pageEvents)))
-        setContextWindow(latestContextWindow([...pageEvents, ...buffered]))
+        const folder = new EventFolder(foldEvents(page.events.map(eventOf)))
+        folderRef.current = folder
+        setMessages(folder.fold(buffered))
         setHasOlder(page.hasMore)
         setLoading(false)
         // The history-tail projection baseline seeds the permission picker.
@@ -194,8 +229,9 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           void loadHistory(session.sessionId, undefined, controller.signal).then(
             (fresh) => {
               if (cancelled) return
-              setMessages(previous => foldEvents(fresh.events.map(eventOf), previous))
-              setContextWindow(previous => latestContextWindow(fresh.events.map(eventOf), previous))
+              const folder = folderRef.current
+              const freshEvents = fresh.events.map(eventOf)
+              setMessages(previous => folder === undefined ? foldEvents(freshEvents, previous) : folder.fold(freshEvents))
               liveBufferOverflowRef.current = false
             },
             (reason: unknown) => {
@@ -212,8 +248,8 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         liveBufferRef.current = []
         tailLoadingRef.current = false
         if (buffered.length > 0) {
-          setMessages(foldEvents(buffered))
-          setContextWindow(latestContextWindow(buffered))
+          const folder = folderRef.current
+          setMessages(folder === undefined ? foldEvents(buffered) : folder.fold(buffered))
         }
         setError(errorText(reason))
         setLoading(false)
@@ -241,6 +277,11 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
       if (frame.type === 'session/event') {
         if (frame.sessionId !== session.sessionId) return
         const event = frame.event as WireEvent
+        // Track the turn running state for the "outputting" indicator (#1017).
+        if (typeof event.type === 'string') {
+          if (event.type === 'turn/start') setRunning(true)
+          if (event.type === 'turn/end') setRunning(false)
+        }
         if (tailLoadingRef.current) {
           if (liveBufferRef.current.length >= MAX_TAIL_BUFFER_EVENTS) {
             // Bound the tail-load window: drop the oldest buffered event and
@@ -257,8 +298,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           liveBufferRef.current.push(event)
           return
         }
-        setMessages(previous => foldEvents([event], previous))
-        setContextWindow(previous => latestContextWindow([event], previous))
+        setMessages(previous => {
+          const folder = folderRef.current
+          return folder === undefined ? foldEvents([event], previous) : folder.fold([event])
+        })
         return
       }
       // Live projection pushes keep the permission picker current.
@@ -266,9 +309,61 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         && frame.sessionId === session.sessionId
         && frame.key === 'permissions') {
         setPermissions(parsePermissionSelect(frame.value))
+        return
+      }
+      // Approval/question frames for this session (#1025).
+      if (!('sessionId' in frame) || frame.sessionId !== session.sessionId) return
+      if (frame.type === 'approval/requested') {
+        setPendingApprovals(previous => {
+          if (previous.some(a => a.approvalId === frame.approvalId)) return previous
+          return [...previous, {
+            approvalId: frame.approvalId as string,
+            toolName: frame.toolName,
+            callId: frame.callId as string | undefined,
+            reason: frame.reason,
+          }]
+        })
+        return
+      }
+      if (frame.type === 'approval/resolved') {
+        setPendingApprovals(previous => previous.filter(a => a.approvalId !== frame.approvalId))
+        return
+      }
+      if (frame.type === 'question/requested') {
+        const items = (frame.questions as Array<{
+          id: string; question: string; detail?: string; header?: string
+          options?: Array<{ label: string; description?: string }>; multiSelect?: boolean
+        }>)
+        setPendingQuestions(items)
+        return
+      }
+      if (frame.type === 'question/resolved') {
+        setPendingQuestions([])
+        return
       }
     })
   }, [mux, session.sessionId])
+
+  // Weak-network polling fallback: when the assistant is running, poll for
+  // pending approvals/questions every 1.5 s so the phone can act even if the
+  // SSE channel drops frames (#1025).
+  useEffect(() => {
+    if (!running) return
+    let cancelled = false
+    const tick = (): void => {
+      void fetchPending(session.sessionId).then(
+        (state) => {
+          if (cancelled) return
+          setPendingApprovals(state.approvals)
+          setPendingQuestions(state.questions)
+        },
+        () => { /* transient; next tick retries */ },
+      )
+    }
+    tick()
+    const timer = setInterval(tick, 1500)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [running, session.sessionId])
 
   const scrollToBottom = useCallback(() => {
     const el = scrollRef.current
@@ -314,7 +409,13 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
         pendingRef.current = false
         setLoading(false)
         const older = foldEvents(page.events.map(eventOf))
-        setMessages(previous => [...older, ...previous])
+        const folder = folderRef.current
+        if (folder === undefined) {
+          setMessages(previous => [...older, ...previous])
+        } else {
+          folder.prepend(older)
+          setMessages(folder.snapshot())
+        }
         setHasOlder(page.hasMore)
       },
       (reason: unknown) => {
@@ -342,28 +443,46 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     )
   }, [input, sending, session.sessionId])
 
+  /**
+   * Stop the active turn (desktop parity: the composer's primary button
+   * becomes a stop button while running). The turn/end frame arriving over
+   * mux flips the button back; a failed request surfaces through the chat
+   * error line.
+   */
+  const stopTurn = useCallback(() => {
+    if (stopping) return
+    setStopping(true)
+    void cancelSession(session.sessionId).then(
+      () => { setStopping(false) },
+      (reason: unknown) => {
+        setStopping(false)
+        setError(errorText(reason))
+      },
+    )
+  }, [stopping, session.sessionId])
+
   const modelLabel = currentModel?.model ?? '模型'
   const permissionLabel = permissions === undefined
     ? undefined
     : permissions.options.find(option => option.value === permissions.currentValue)?.name
       ?? displayName(permissions.currentValue)
-  /** Messages after the display-option filter (host-injected rows hidden by default). */
-  const visibleMessages = displayOptions.showSystemMessages
-    ? messages
-    : messages.filter(message => message.sourceKind === undefined)
 
-  // Context occupancy: the latest step's full prompt against the advertised
-  // window (the prompt the next request builds on). Hidden until both exist.
-  let contextPercent: number | undefined
-  if (contextWindow !== undefined) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const usage = messages[i]?.usage
-      if (usage === undefined) continue
-      const used = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
-      contextPercent = Math.min(100, Math.round((used / contextWindow.window) * 100))
-      break
+  // Context usage chip: the most recent assistant message carrying both usage and
+  // a positive context window drives the percentage. Scanned from the end so a
+  // newer answer (whose usage may be the last one reported) takes precedence.
+  const contextUsage = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      const usage = message.usage
+      if (message.kind !== 'assistant' || usage === undefined) continue
+      const window = message.contextWindow
+      if (window === undefined || window <= 0) continue
+      const tokens = usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+      const pct = Math.round(tokens / window * 100)
+      return { pct }
     }
-  }
+    return undefined
+  }, [messages])
 
   return (
     <div className="chat">
@@ -379,14 +498,45 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
             {loading ? '加载中…' : '加载更早的消息'}
           </button>
         )}
-        {visibleMessages.map(message => <MessageRow key={message.id} message={message} showTools={displayOptions.showTools} />)}
-        {loading && visibleMessages.length === 0 && <p className="chat-typing">加载中…</p>}
-        {!loading && visibleMessages.length === 0 && <p className="chat-typing">还没有消息，发一句话开始吧</p>}
+        {messages.map(message => (
+          <MessageRow
+            key={message.id}
+            message={message}
+            showToolCalls={showToolCalls}
+            showSystemMessages={showSystemMessages}
+          />
+        ))}
+        {loading && messages.length === 0 && <p className="chat-typing">加载中…</p>}
+        {!loading && messages.length === 0 && <p className="chat-typing">还没有消息，发一句话开始吧</p>}
+        {running && (
+          <div className="chat-turn-status" role="status" aria-label="输出中">
+            输出中<span className="chat-turn-dots" aria-hidden><span /><span /><span /></span>
+          </div>
+        )}
+        {pendingApprovals.map(approval => (
+          <ApprovalPanel
+            key={approval.approvalId}
+            approval={approval}
+            sessionId={session.sessionId}
+            onResolved={(id) => { setPendingApprovals(prev => prev.filter(a => a.approvalId !== id)) }}
+          />
+        ))}
+        {pendingQuestions.length > 0 && (
+          <QuestionPanel
+            questions={pendingQuestions}
+            sessionId={session.sessionId}
+            onResolved={() => { setPendingQuestions([]) }}
+          />
+        )}
       </div>
       <div className="chat-tools">
         <button type="button" className="chat-chip" onClick={() => { setSheet('model') }} aria-haspopup="dialog">
           <span className="chat-chip-label">模型</span>
           <span className="chat-chip-value">{modelLabel}</span>
+          <span className="chat-chip-chevron" aria-hidden>›</span>
+        </button>
+        <button type="button" className="chat-chip" onClick={() => { setSheet('display') }} aria-haspopup="dialog">
+          <span className="chat-chip-label">显示</span>
           <span className="chat-chip-chevron" aria-hidden>›</span>
         </button>
         {permissionLabel !== undefined && (
@@ -396,14 +546,10 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
             <span className="chat-chip-chevron" aria-hidden>›</span>
           </button>
         )}
-        <button type="button" className="chat-chip" onClick={() => { setSheet('display') }} aria-haspopup="dialog">
-          <span className="chat-chip-label">显示</span>
-          <span className="chat-chip-chevron" aria-hidden>›</span>
-        </button>
-        {contextPercent !== undefined && (
-          <span className={`chat-context${contextPercent >= 80 ? ' chat-context-high' : ''}`}>
-            上下文 {contextPercent}%
-          </span>
+        {contextUsage !== undefined && (
+          <div className={"chat-context" + (contextUsage.pct >= 80 ? " chat-context-warn" : "")}>
+            上下文 {contextUsage.pct}%
+          </div>
         )}
       </div>
       <div className="chat-inputbar">
@@ -421,8 +567,18 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
             }
           }}
         />
-        <button type="button" className="chat-send" disabled={sending || input.trim() === ''} onClick={() => { void send() }}>
-          {sending ? '发送中…' : '发送'}
+        <button
+          type="button"
+          className={running ? 'chat-send chat-send-stop' : 'chat-send'}
+          {...(running ? { 'aria-label': stopping ? '停止中' : '停止' } : {})}
+          disabled={running ? stopping : sending || input.trim() === ''}
+          onClick={() => { if (running) void stopTurn(); else void send() }}
+        >
+          {running ? (
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="10" height="10" rx="3" fill="currentColor" />
+            </svg>
+          ) : sending ? '发送中…' : '发送'}
         </button>
       </div>
       {sheet === 'model' && (
@@ -443,29 +599,63 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
           onClose={() => { setSheet(null) }}
         />
       )}
-      {sheet === 'display' && <DisplaySheet onClose={() => { setSheet(null) }} />}
+      {sheet === 'display' && (
+        <DisplaySheet
+          showToolCalls={showToolCalls}
+          showSystemMessages={showSystemMessages}
+          onToolCalls={(value) => { setShowToolCalls(value); writeStoredBoolean(SHOW_TOOL_CALLS_KEY, value) }}
+          onSystemMessages={(value) => { setShowSystemMessages(value); writeStoredBoolean(SHOW_SYSTEM_MESSAGES_KEY, value) }}
+          onClose={() => { setSheet(null) }}
+        />
+      )}
     </div>
   )
 }
 
 /* ── message rows ─────────────────────────────────────────────────────── */
 
-/** One rendered message row (user bubble or assistant bubble with folds). */
-function MessageRow({ message, showTools }: { message: RenderMessage; showTools: boolean }) {
+/**
+ * One rendered message row (user bubble or assistant bubble with folds).
+ * Memoized: live streaming updates exactly one message object per frame, so
+ * unchanged rows skip re-rendering their markdown/sub-components.
+ */
+const MessageRow = memo(function MessageRow({ message, showToolCalls, showSystemMessages }: {
+  message: RenderMessage
+  showToolCalls: boolean
+  showSystemMessages: boolean
+}) {
+  // Injected user messages (sourceKind defined and not 'user') hide behind
+  // the system-message toggle.
+  if (message.kind === 'user'
+    && message.sourceKind !== undefined
+    && message.sourceKind !== 'user'
+    && !showSystemMessages) {
+    return null
+  }
+  const hasReasoning = message.kind === 'assistant' && message.reasoning !== undefined && message.reasoning !== ''
+  const hasTools = showToolCalls && message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0
+  const hasText = message.text !== ''
+  const hasFailTag = message.failed === true
+
+  if (!hasReasoning && !hasTools && !hasText && !hasFailTag) {
+    return null
+  }
   return (
     <div className={`chat-msg chat-msg-${message.kind}${message.pending === true ? ' chat-msg-pending' : ''}${message.failed === true ? ' chat-msg-failed' : ''}`}>
       {message.kind === 'assistant' && message.reasoning !== undefined && message.reasoning !== '' && (
         <ReasoningDisclosure text={message.reasoning} pending={message.pending === true} />
       )}
-      {showTools && message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0 && (
+      {showToolCalls && message.kind === 'assistant' && message.tools !== undefined && message.tools.length > 0 && (
         <ToolDisclosure tools={message.tools} />
       )}
-      <CollapsibleBody text={message.text} markdown={message.kind === 'assistant'} />
+      {message.kind === 'assistant'
+        ? <MarkdownText text={message.text} pending={message.pending === true} />
+        : <CollapsibleText text={message.text} />}
       {message.failed === true && <span className="chat-msg-failtag">本次回复失败</span>}
       <span className="chat-msg-time">{formatTime(message.time)}</span>
     </div>
   )
-}
+})
 
 /** Collapsed-by-default reasoning disclosure (web-UI Think-row parity). */
 function ReasoningDisclosure({ text, pending }: { text: string; pending: boolean }) {
@@ -488,10 +678,10 @@ function ReasoningDisclosure({ text, pending }: { text: string; pending: boolean
   )
 }
 
-/** Collapsed-by-default tool-call disclosure: summary row + expandable details. */
+/** Collapsed-by-default tool-call disclosure: pill tag summary + card details (#529). */
 function ToolDisclosure({ tools }: { tools: ToolCallInfo[] }) {
   const [open, setOpen] = useState(false)
-  const names = [...new Set(tools.map(tool => tool.name))].join(' / ')
+  const uniqueNames = [...new Set(tools.map(tool => tool.name))]
   return (
     <div className={`chat-disclosure chat-tools${open ? ' chat-disclosure-open' : ''}`}>
       <button
@@ -502,15 +692,23 @@ function ToolDisclosure({ tools }: { tools: ToolCallInfo[] }) {
       >
         <span className="chat-disclosure-caret" aria-hidden>›</span>
         <span className="chat-disclosure-label">工具</span>
-        {!open && <span className="chat-disclosure-summary">{names}</span>}
+        {!open && (
+          <span className="chat-disclosure-summary chat-tool-pills">
+            {uniqueNames.map(name => (
+              <span key={name} className="chat-tool-pill">{name}</span>
+            ))}
+          </span>
+        )}
         <span className="chat-disclosure-count">{tools.length} 次</span>
       </button>
       {open && (
         <div className="chat-disclosure-body chat-tools-body">
           {tools.map((tool, index) => (
-            <div className="chat-tool-item" key={`${tool.callId}-${index}`}>
-              <span className="chat-tool-name">{tool.name}</span>
-              {tool.arguments !== undefined && <pre className="chat-tool-args">{tool.arguments}</pre>}
+            <div className="chat-tool-card" key={`${tool.callId}-${index}`}>
+              <span className="chat-tool-pill">{tool.name}</span>
+              {tool.arguments !== undefined && (
+                <pre className="chat-tool-args">{tool.arguments}</pre>
+              )}
             </div>
           ))}
         </div>
@@ -519,35 +717,109 @@ function ToolDisclosure({ tools }: { tools: ToolCallInfo[] }) {
   )
 }
 
-/** Long message bodies collapse behind an explicit expand toggle. Assistant
- *  text renders as Markdown (the collapsed preview slices the raw source, so
- *  a cut mid-construct degrades to literal text — acceptable for a preview);
- *  user prompts stay plain. */
-function CollapsibleBody({ text, markdown }: { text: string; markdown: boolean }) {
+/**
+ * Minimum interval between full markdown re-parses of a live (pending)
+ * assistant message. Every streamed chunk replaces the message object, and
+ * re-parsing the whole accumulated text per chunk turns a long reply into
+ * O(n^2) work on mobile. Pending text keeps the last parsed result visible
+ * and re-parses at most once per interval; the moment the turn closes the
+ * final text parses immediately, so terminal messages render exactly as
+ * before.
+ */
+export const STREAM_RENDER_INTERVAL_MS = 120
+
+/**
+ * Assistant text rendered as GFM markdown (escape-first, protocol
+ * allow-list — see markdown.ts). Long replies collapse by clamping the
+ * rendered block height instead of slicing the source, so half-cut code
+ * fences or tables never leak malformed markup into the DOM. User
+ * messages stay plain text (CollapsibleText).
+ */
+function MarkdownText({ text, pending }: { text: string; pending: boolean }) {
   const [open, setOpen] = useState(false)
-  if (text.length <= LONG_TEXT_LIMIT) {
-    return markdown
-      ? <MarkdownText text={text} />
-      : <span className="chat-msg-text">{text}</span>
-  }
-  const shown = open ? text : text.slice(0, LONG_TEXT_PREVIEW)
+  const [html, setHtml] = useState<string>(() => renderMarkdown(text))
+  /** Text of the last render actually applied to `html`. */
+  const renderedTextRef = useRef(text)
+  /** Newest streamed text, read by the trailing render at fire time. */
+  const latestTextRef = useRef(text)
+  /** Timestamp of the last applied parse (throttle window start). */
+  const lastRenderAtRef = useRef(performance.now())
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+
+  // Throttled parse for a live stream: skip parses while the newest text is
+  // already rendered, parse immediately once the throttle window elapsed,
+  // otherwise schedule one trailing render that picks up the newest text.
+  useEffect(() => {
+    latestTextRef.current = text
+    if (!pending) {
+      // Turn closed: terminal messages are never throttled, so cancel any
+      // scheduled stream render and parse the final text immediately.
+      if (timerRef.current !== undefined) {
+        clearTimeout(timerRef.current)
+        timerRef.current = undefined
+      }
+      if (text === renderedTextRef.current) return
+      lastRenderAtRef.current = performance.now()
+      renderedTextRef.current = text
+      setHtml(renderMarkdown(text))
+      return
+    }
+    if (text === renderedTextRef.current) return
+    const elapsed = performance.now() - lastRenderAtRef.current
+    if (elapsed >= STREAM_RENDER_INTERVAL_MS) {
+      lastRenderAtRef.current = performance.now()
+      renderedTextRef.current = text
+      setHtml(renderMarkdown(text))
+      return
+    }
+    if (timerRef.current === undefined) {
+      timerRef.current = setTimeout(() => {
+        timerRef.current = undefined
+        lastRenderAtRef.current = performance.now()
+        renderedTextRef.current = latestTextRef.current
+        setHtml(renderMarkdown(latestTextRef.current))
+      }, STREAM_RENDER_INTERVAL_MS - elapsed)
+    }
+  }, [text, pending])
+
+  // Cancel the trailing stream render if the row unmounts mid-stream.
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== undefined) clearTimeout(timerRef.current)
+    }
+  }, [])
+  const long = !pending && text.length > LONG_TEXT_LIMIT
+  const collapsed = long && !open
   return (
-    <div className="chat-msg-text">
-      {markdown ? <MarkdownText text={shown} /> : shown}{!open ? '…' : ''}
-      <button type="button" className="chat-msg-toggle" onClick={() => { setOpen(value => !value) }}>
-        {open ? '收起' : `展开全文（${text.length} 字）`}
-      </button>
+    <div className={'chat-msg-text chat-md' + (collapsed ? ' chat-md-collapsed' : '')}>
+      <div className="chat-md-body" dangerouslySetInnerHTML={{ __html: html }} />
+      {long && (
+        <button type="button" className="chat-msg-toggle" onClick={() => { setOpen(value => !value) }}>
+          {open ? '收起' : '展开全文（' + text.length + ' 字）'}
+        </button>
+      )}
     </div>
   )
 }
 
-/** Sanitized Markdown body of one assistant message. */
-function MarkdownText({ text }: { text: string }) {
-  const html = useMemo(() => renderMarkdown(text), [text])
-  return <div className="chat-msg-text chat-md" dangerouslySetInnerHTML={{ __html: html }} />
+/** Long assistant text collapses behind an explicit expand toggle. */
+function CollapsibleText({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  if (text.length <= LONG_TEXT_LIMIT) {
+    return <span className="chat-msg-text">{text}</span>
+  }
+  const shown = open ? text : text.slice(0, LONG_TEXT_PREVIEW)
+  return (
+    <span className="chat-msg-text">
+      {shown}{!open ? '…' : ''}
+      <button type="button" className="chat-msg-toggle" onClick={() => { setOpen(value => !value) }}>
+        {open ? '收起' : `展开全文（${text.length} 字）`}
+      </button>
+    </span>
+  )
 }
 
-const LONG_TEXT_LIMIT = 1600
+export const LONG_TEXT_LIMIT = 6000
 const LONG_TEXT_PREVIEW = 800
 
 /** Latest non-empty line of a streaming reasoning buffer. */
@@ -809,40 +1081,215 @@ function PermissionSheet({ sessionId, value, onChanged, onClose }: {
   )
 }
 
-/** Display-option toggles: tool-call disclosures and host-injected messages. */
-function DisplaySheet({ onClose }: { onClose(): void }) {
-  const options = useSyncExternalStore(subscribeDisplayOptions, getDisplayOptions)
-  const rows = [
-    {
-      key: 'showTools' as const,
-      title: '工具调用',
-      description: '关闭后只保留最终回复，不再展示工具调用卡片',
-      on: options.showTools,
-    },
-    {
-      key: 'showSystemMessages' as const,
-      title: '系统提示词',
-      description: '工作区指令、技能目录等注入内容',
-      on: options.showSystemMessages,
-    },
-  ]
+/** The display-options sheet: tool calls and injected system messages toggles. */
+function DisplaySheet({ showToolCalls, showSystemMessages, onToolCalls, onSystemMessages, onClose }: {
+  showToolCalls: boolean
+  showSystemMessages: boolean
+  onToolCalls(value: boolean): void
+  onSystemMessages(value: boolean): void
+  onClose(): void
+}) {
   return (
-    <Sheet title="显示选项" onClose={onClose}>
-      {rows.map(row => (
+    <Sheet title="显示" onClose={onClose}>
+      <div role="group" aria-label="显示选项">
+        <div className="sheet-toggle-row">
+          <div className="sheet-toggle-copy">
+            <span className="sheet-toggle-title">工具调用</span>
+            <span className="sheet-toggle-desc">显示助手使用的工具调用</span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-label="工具调用"
+            aria-checked={showToolCalls}
+            className={`sheet-toggle-switch${showToolCalls ? ' sheet-toggle-switch-on' : ''}`}
+            onClick={() => { onToolCalls(!showToolCalls) }}
+          >
+            <span className="sheet-toggle-switch-knob" aria-hidden />
+          </button>
+        </div>
+        <div className="sheet-toggle-row">
+          <div className="sheet-toggle-copy">
+            <span className="sheet-toggle-title">系统提示词</span>
+            <span className="sheet-toggle-desc">显示注入到对话中的系统消息</span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-label="系统提示词"
+            aria-checked={showSystemMessages}
+            className={`sheet-toggle-switch${showSystemMessages ? ' sheet-toggle-switch-on' : ''}`}
+            onClick={() => { onSystemMessages(!showSystemMessages) }}
+          >
+            <span className="sheet-toggle-switch-knob" aria-hidden />
+          </button>
+        </div>
+      </div>
+    </Sheet>
+  )
+}
+
+/* ── approval / question panels (#1025) ──────────────────────────────── */
+
+/** One pending tool approval card with allow/reject actions. */
+function ApprovalPanel({ approval, sessionId, onResolved }: {
+  approval: PendingApproval
+  sessionId: string
+  onResolved(approvalId: string): void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [panelError, setPanelError] = useState<string | undefined>(undefined)
+
+  const act = (outcome: 'allowed-once' | 'rejected'): void => {
+    if (busy) return
+    setBusy(true)
+    setPanelError(undefined)
+    void respondApproval(sessionId, approval.approvalId, outcome).then(
+      () => { onResolved(approval.approvalId) },
+      (reason: unknown) => {
+        setBusy(false)
+        setPanelError(reason instanceof Error ? reason.message : String(reason))
+      },
+    )
+  }
+
+  return (
+    <div className="chat-approval-panel" role="alert">
+      <div className="chat-approval-header">
+        <span className="chat-tool-pill">{approval.toolName}</span>
+        {approval.reason !== undefined && (
+          <span className="chat-approval-reason">{approval.reason}</span>
+        )}
+      </div>
+      {panelError !== undefined && <p className="chat-approval-error">{panelError}</p>}
+      <div className="chat-approval-actions">
         <button
           type="button"
-          key={row.key}
-          className={`sheet-option${row.on ? ' sheet-option-selected' : ''}`}
-          aria-pressed={row.on}
-          onClick={() => { setDisplayOptions({ [row.key]: !row.on }) }}
+          className="chat-approval-allow"
+          disabled={busy}
+          onClick={() => { act('allowed-once') }}
         >
-          <span className="sheet-option-copy">
-            <span className="sheet-option-title">{row.title}</span>
-            <span className="sheet-option-desc">{row.description}</span>
-          </span>
-          {row.on && <span className="sheet-option-check" aria-hidden>√</span>}
+          {busy ? '提交中…' : '允许一次'}
         </button>
-      ))}
-    </Sheet>
+        <button
+          type="button"
+          className="chat-approval-reject"
+          disabled={busy}
+          onClick={() => { act('rejected') }}
+        >
+          拒绝
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** Question panel: renders one or more questions with option pickers and a submit button. */
+function QuestionPanel({ questions, sessionId, onResolved }: {
+  questions: PendingQuestionItem[]
+  sessionId: string
+  onResolved(): void
+}) {
+  const [selections, setSelections] = useState<Map<string, { selected: string[]; custom: string }>>(
+    () => new Map(questions.map(q => [q.id, { selected: [], custom: '' }])),
+  )
+  const [busy, setBusy] = useState(false)
+  const [panelError, setPanelError] = useState<string | undefined>(undefined)
+
+  const toggle = (questionId: string, label: string, multi: boolean): void => {
+    setSelections(previous => {
+      const next = new Map(previous)
+      const entry = next.get(questionId) ?? { selected: [], custom: '' }
+      if (multi) {
+        const set = new Set(entry.selected)
+        if (set.has(label)) set.delete(label); else set.add(label)
+        next.set(questionId, { ...entry, selected: [...set] })
+      } else {
+        next.set(questionId, { ...entry, selected: [label] })
+      }
+      return next
+    })
+  }
+
+  const setCustom = (questionId: string, value: string): void => {
+    setSelections(previous => {
+      const next = new Map(previous)
+      const entry = next.get(questionId) ?? { selected: [], custom: '' }
+      next.set(questionId, { ...entry, custom: value })
+      return next
+    })
+  }
+
+  const submit = (): void => {
+    if (busy) return
+    setBusy(true)
+    setPanelError(undefined)
+    const answers = questions.map(q => {
+      const entry = selections.get(q.id) ?? { selected: [], custom: '' }
+      return {
+        id: q.id,
+        selected: entry.selected,
+        ...(entry.custom.trim() !== '' ? { custom: entry.custom.trim() } : {}),
+      }
+    })
+    void respondQuestion(sessionId, answers).then(
+      () => { onResolved() },
+      (reason: unknown) => {
+        setBusy(false)
+        setPanelError(reason instanceof Error ? reason.message : String(reason))
+      },
+    )
+  }
+
+  return (
+    <div className="chat-question-panel" role="form" aria-label="问题">
+      {questions.map(q => {
+        const entry = selections.get(q.id) ?? { selected: [], custom: '' }
+        return (
+          <div className="chat-question-group" key={q.id}>
+            {q.header !== undefined && <div className="chat-question-header">{q.header}</div>}
+            <div className="chat-question-text">{q.question}</div>
+            {q.detail !== undefined && <div className="chat-question-detail">{q.detail}</div>}
+            {q.options !== undefined && q.options.length > 0 && (
+              <div className="chat-question-options" role="group" aria-label={q.question}>
+                {q.options.map(option => {
+                  const checked = entry.selected.includes(option.label)
+                  return (
+                    <label key={option.label} className={`chat-question-option${checked ? ' chat-question-option-selected' : ''}`}>
+                      <input
+                        type={q.multiSelect ? 'checkbox' : 'radio'}
+                        name={`q-${q.id}`}
+                        checked={checked}
+                        onChange={() => { toggle(q.id, option.label, q.multiSelect === true) }}
+                      />
+                      <span className="chat-question-option-label">{option.label}</span>
+                      {option.description !== undefined && (
+                        <span className="chat-question-option-desc">{option.description}</span>
+                      )}
+                    </label>
+                  )
+                })}
+              </div>
+            )}
+            <textarea
+              className="chat-question-custom"
+              placeholder="自定义回答（可选）"
+              rows={2}
+              value={entry.custom}
+              onChange={(e) => { setCustom(q.id, e.target.value) }}
+            />
+          </div>
+        )
+      })}
+      {panelError !== undefined && <p className="chat-approval-error">{panelError}</p>}
+      <button
+        type="button"
+        className="chat-question-submit"
+        disabled={busy}
+        onClick={submit}
+      >
+        {busy ? '提交中…' : '提交回答'}
+      </button>
+    </div>
   )
 }

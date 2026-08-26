@@ -6,7 +6,7 @@
  */
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconCloseOutline16, IconRefreshOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { UpdateRunResult, UpdateStatus } from '../update.ts'
+import type { UpdateReleaseNotes, UpdateRunResult, UpdateStatus } from '../update.ts'
 import css from "./remote.module.css"
 
 /** The panel view state, owned by the entry component. */
@@ -24,6 +24,8 @@ export interface UpdatePanelProps {
   onClose(): void
   /** Re-run the check from a terminal state. */
   onRecheck(): void
+  /** Start the update from the result view (the confirmation step, #507). */
+  onStartUpdate(status: UpdateStatus): void
 }
 
 /** The anchor package name (aggregate first) for copy purposes. */
@@ -41,7 +43,7 @@ function anchorLatest(status: UpdateStatus | undefined): string | undefined {
  * @param props - copy, view state, and actions.
  * @returns the panel element tree.
  */
-export function UpdatePanel({ t, view, onClose, onRecheck }: UpdatePanelProps) {
+export function UpdatePanel({ t, view, onClose, onRecheck, onStartUpdate }: UpdatePanelProps) {
   const status = view.kind === "result" || view.kind === "updating" ? view.status : undefined
   const title = view.kind === "done" && view.result.ok ? t("update.done") : t("update.title")
   const subtitle = subtitleOf(t, view)
@@ -58,12 +60,20 @@ export function UpdatePanel({ t, view, onClose, onRecheck }: UpdatePanelProps) {
       </div>
       {view.kind === "checking" && <p className={css.updateStatus}>{t("update.checking")}</p>}
       {view.kind === "result" && status !== undefined && <ResultBody t={t} status={status} />}
+      {view.kind === "result" && status !== undefined && status.mode === "npm" && status.outdated && status.error === undefined && (
+        <div className={css.updateActions}>
+          <button type="button" className={css.updateRetry} onClick={() => onStartUpdate(status)}>
+            {t("update.start")}
+          </button>
+        </div>
+      )}
       {view.kind === "updating" && status !== undefined && (
         <div>
           <p className={css.updateStatus}>
             {t("update.updating", { name: anchorName(status) ?? "", version: anchorLatest(status) ?? "" })}
           </p>
-          <PackageList status={status} />
+          <p className={css.updateDetail}>{t("update.cooldownNotice")}</p>
+          <PackageSummary t={t} status={status} />
         </div>
       )}
       {view.kind === "done" && <DoneBody t={t} result={view.result} />}
@@ -136,6 +146,8 @@ function ResultBody({ t, status }: { t: TranslateNS<"remote">; status: UpdateSta
         <p className={css.updateDetail}>
           {anchor !== undefined ? t("update.foundDetail", { name: anchor, version: latest ?? "" }) : ""}
         </p>
+        <p className={css.updateDetail}>{t("update.cooldownNotice")}</p>
+        <PackageSummary t={t} status={status} />
       </div>
     )
   }
@@ -145,7 +157,46 @@ function ResultBody({ t, status }: { t: TranslateNS<"remote">; status: UpdateSta
       {anchor !== undefined && latest !== undefined && (
         <p className={css.updateDetail}>{t("update.upToDateDetail", { name: anchor, version: latest })}</p>
       )}
-      <PackageList status={status} />
+      <PackageSummary t={t} status={status} />
+    </div>
+  )
+}
+
+/** Release-note summary when available; otherwise fall back to the package list. */
+function PackageSummary({ t, status }: { t: TranslateNS<'remote'>; status: UpdateStatus }) {
+  if (status.notes === undefined) return <PackageList status={status} />
+  return (
+    <div>
+      <ReleaseNotes t={t} notes={status.notes} />
+      <details className={css.updateVersions}>
+        <summary className={css.updateVersionsSummary}>{t("update.componentVersions")}</summary>
+        <PackageList status={status} />
+      </details>
+    </div>
+  )
+}
+
+/** Render GitHub Release sections as a compact three-group list. */
+function ReleaseNotes({ t, notes }: { t: TranslateNS<'remote'>; notes: UpdateReleaseNotes }) {
+  const sections = [
+    { key: 'features', title: t("update.releaseFeatures"), items: notes.features },
+    { key: 'fixes', title: t("update.releaseFixes"), items: notes.fixes },
+    { key: 'other', title: t("update.releaseOther"), items: notes.other },
+  ].filter(section => section.items.length > 0)
+  if (sections.length === 0) return <p className={css.updateDetail}>{t("update.releaseUnavailable")}</p>
+  return (
+    <div className={css.updateNotes}>
+      <h3 className={css.updateNotesTitle}>{t("update.releaseNotes", { version: notes.version })}</h3>
+      {sections.map(section => (
+        <section key={section.key} className={css.updateNoteSection}>
+          <h4 className={css.updateNoteHeading}>{section.title}</h4>
+          <ul className={css.updateNoteList}>
+            {section.items.map((item, index) => (
+              <li key={index} className={css.updateNoteItem}>{item}</li>
+            ))}
+          </ul>
+        </section>
+      ))}
     </div>
   )
 }
@@ -198,6 +249,8 @@ function errorMessageOf(t: TranslateNS<"remote">, result: UpdateRunResult): stri
     case "not-found": return t("update.error.notFound")
     case "link": return t("update.error.link")
     case "pnpm-failed": return t("update.error.pnpmFailed", { code: String(result.exitCode ?? "?") })
+    case "stale": return t("update.error.stale")
+    case "verify-failed": return t("update.error.verifyFailed")
     default: return result.error ?? t("update.error.unknown")
   }
 }

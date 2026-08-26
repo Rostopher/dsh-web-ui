@@ -80,8 +80,9 @@ describe('MuxClient polling fallback', () => {
     await vi.advanceTimersByTimeAsync(400)
     expect(pollLatest).not.toHaveBeenCalled()
 
-    // Past the stall threshold the first poll runs and emits seq 0.
-    await vi.advanceTimersByTimeAsync(700) // 1100ms total -> first stall-checker tick
+    // The single tick (400 ms) crosses the 800 ms stall threshold at 1200 ms:
+    // the same tick then runs the first poll and emits seq 0.
+    await vi.advanceTimersByTimeAsync(800) // 1200ms total -> first stall crossing tick
     expect(pollLatest).toHaveBeenCalledWith('s1')
     expect(frames).toHaveLength(1)
     expect(frames[0]).toMatchObject({ type: 'session/event', sessionId: 's1' })
@@ -91,6 +92,22 @@ describe('MuxClient polling fallback', () => {
     await vi.advanceTimersByTimeAsync(400)
     expect(frames).toHaveLength(2)
     expect(frames[1]?.event).toMatchObject({ seq: 1 })
+    client.stop()
+  })
+
+  it('sorts an out-of-order history page before advancing the watermark', async () => {
+    const { factory } = makeSources()
+    const pollLatest = vi.fn(async (_sessionId: string) => pageOf([2, 1, 3]))
+    const client = new MuxClient('/m/api/events.mux', baseOptions(pollLatest, factory))
+    const seqs: number[] = []
+    client.onFrame((frame) => {
+      if (frame.type === 'session/event' && typeof frame.event.seq === 'number') seqs.push(frame.event.seq)
+    })
+    client.start()
+    client.observe('s1')
+
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(seqs).toEqual([1, 2, 3])
     client.stop()
   })
 
@@ -104,7 +121,7 @@ describe('MuxClient polling fallback', () => {
     client.start()
     client.observe('s1')
 
-    await vi.advanceTimersByTimeAsync(1100) // first poll -> 3 events
+    await vi.advanceTimersByTimeAsync(1200) // first poll -> 3 events
     expect(frames).toHaveLength(3)
 
     await vi.advanceTimersByTimeAsync(400) // second poll -> same page, nothing new
@@ -119,7 +136,7 @@ describe('MuxClient polling fallback', () => {
     client.start()
     client.observe('s1')
 
-    await vi.advanceTimersByTimeAsync(1100)
+    await vi.advanceTimersByTimeAsync(1200)
     expect(pollLatest).toHaveBeenCalled()
 
     client.observe(undefined)
@@ -136,7 +153,7 @@ describe('MuxClient polling fallback', () => {
     client.start()
     client.observe('s1')
 
-    await vi.advanceTimersByTimeAsync(1100)
+    await vi.advanceTimersByTimeAsync(1200)
     expect(pollLatest).toHaveBeenCalled()
 
     client.stop()
@@ -156,7 +173,7 @@ describe('MuxClient polling fallback', () => {
     client.observe('s1')
 
     // Stall into polling.
-    await vi.advanceTimersByTimeAsync(1100)
+    await vi.advanceTimersByTimeAsync(1200)
     expect(pollLatest).toHaveBeenCalledTimes(1)
 
     // A live mux frame proves SSE delivers again -> fallback stops.
@@ -167,6 +184,131 @@ describe('MuxClient polling fallback', () => {
     const live = frames.filter(frame => (frame as { type?: string })?.type === 'session/subscribed')
     expect(live).toHaveLength(1)
     expect(live[0]).toMatchObject({ type: 'session/subscribed', sessionId: 's1' })
+    client.stop()
+  })
+
+  it('recovers when a previously-live SSE stream becomes silently stalled', async () => {
+    const { factory, sources } = makeSources()
+    const pollLatest = vi.fn(async (_sessionId: string) => pageOf([5]))
+    const client = new MuxClient('/m/api/events.mux', baseOptions(pollLatest, factory))
+    const frames: Array<{ type: string; event?: { seq: number } }> = []
+    client.onFrame(frame => { frames.push(frame as never) })
+    client.start()
+    client.observe('s1')
+
+    sources[0]?.onmessage?.({ data: envelopeWith({ type: 'session/subscribed', sessionId: 's1', lastSeq: 4 }) })
+    await vi.advanceTimersByTimeAsync(2400)
+    expect(pollLatest).not.toHaveBeenCalled()
+
+    // A once-live stream gets three stall windows; the next scheduler tick
+    // crosses that boundary and starts the ordinary-HTTP recovery path.
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(1)
+    expect(frames.at(-1)?.event).toMatchObject({ seq: 5 })
+    client.stop()
+  })
+
+  it('backs empty polls off and resets to the base cadence after progress', async () => {
+    const { factory } = makeSources()
+    const pages = [pageOf([]), pageOf([1]), pageOf([1, 2])]
+    const pollLatest = vi.fn(async (_sessionId: string) => pages.shift() ?? pageOf([]))
+    const client = new MuxClient('/m/api/events.mux', baseOptions(pollLatest, factory))
+    client.start()
+    client.observe('s1')
+
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(pollLatest).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(2)
+
+    // The productive second poll resets the next delay from 800 ms to 400 ms.
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(5)
+    client.stop()
+  })
+
+  it('drives the whole lifecycle on a single scheduler tick (one interval)', async () => {
+    const { factory } = makeSources()
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    try {
+      const pages = [pageOf([0]), pageOf([0, 1])]
+      const pollLatest = vi.fn(async (_sessionId: string) => pages.shift() ?? pageOf([]))
+      const client = new MuxClient('/m/api/events.mux', {
+        sourceFactory: factory,
+        pollLatest,
+        stallThresholdMs: 1500,
+        pollIntervalMs: 2000,
+      })
+      client.start()
+      client.observe('s1')
+
+      // Exactly one interval is ever created: the single tick scheduler.
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+
+      // The tick fires below the stall threshold without polling.
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(pollLatest).not.toHaveBeenCalled()
+
+      // The same interval arms the fallback once silence passes the threshold
+      // (tick at 2000 crosses 1500) and runs the first poll immediately.
+      await vi.advanceTimersByTimeAsync(1100) // 2100ms total
+      expect(pollLatest).toHaveBeenCalledTimes(1)
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1) // still one timer
+
+      // Subsequent polls ride the same tick at the poll cadence (2000 ms).
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(pollLatest).toHaveBeenCalledTimes(2)
+      client.stop()
+    } finally {
+      setIntervalSpy.mockRestore()
+    }
+  })
+
+  it('paces polls on the tick only after the stall phase ends', async () => {
+    const { factory } = makeSources()
+    const pages = [pageOf([0]), pageOf([0, 1]), pageOf([0, 1, 2]), pageOf([0, 1, 2, 3])]
+    const pollLatest = vi.fn(async (_sessionId: string) => pages.shift() ?? pageOf([]))
+    const client = new MuxClient('/m/api/events.mux', {
+      sourceFactory: factory,
+      pollLatest,
+      stallThresholdMs: 800,
+      pollIntervalMs: 400,
+    })
+    client.start()
+    client.observe('s1')
+
+    // At 1200 ms the stall threshold is crossed on this single 400 ms tick.
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(pollLatest).toHaveBeenCalledTimes(1)
+
+    // Each subsequent 400 ms tick is a poll, matching the poll cadence.
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(400)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(pollLatest).toHaveBeenCalledTimes(4)
+    client.stop()
+  })
+
+  it('observe() already in the stall window starts the single-tick poller immediately', async () => {
+    const { factory } = makeSources()
+    const pollLatest = vi.fn(async (_sessionId: string) => pageOf([0]))
+    const client = new MuxClient('/m/api/events.mux', baseOptions(pollLatest, factory))
+    client.start()
+    // Advance well past the stall threshold while nothing is observed.
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(pollLatest).not.toHaveBeenCalled()
+
+    // Observing a session now is already in the stall window: poll right away.
+    client.observe('s1')
+    expect(pollLatest).toHaveBeenCalledTimes(1)
     client.stop()
   })
 })
