@@ -399,4 +399,28 @@ describe('EventFolder incremental folding', () => {
     expect(folder.snapshot().map(message => message.id)).toEqual(['u-2'])
     expect(folder.fold([textChunk(0, 0, '追加', 6)]).map(message => message.id)).toEqual(['u-2', 'assistant,0.0#6'])
   })
+  it('renders a host-executed slash command as the user command line', () => {
+    const events: WireEvent[] = [
+      makeEvent('command/run', {
+        commandId: 'cmd-1',
+        name: 'permission',
+        args: ' danger-full-access',
+      }, 0),
+    ]
+    const result = foldEvents(events)
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({ kind: 'user', text: '/permission danger-full-access', seq: 0 })
+    // A replayed run updates in place instead of duplicating the row.
+    const replayed = foldEvents([...events, makeEvent('command/run', {
+      commandId: 'cmd-1',
+      name: 'permission',
+      args: ' danger-full-access',
+    }, 1)], result)
+    expect(replayed).toHaveLength(1)
+  })
+
+  it('renders nothing for a command/run without a name', () => {
+    const result = foldEvents([makeEvent('command/run', { commandId: 'cmd-2' }, 0)])
+    expect(result).toHaveLength(0)
+  })
 })

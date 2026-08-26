@@ -85,6 +85,8 @@ function turnEvents(): Array<{ event: WireEvent }> {
 const fetchMobilePreferencesMock = vi.mocked(fetchMobilePreferences)
 const modelsMock = vi.mocked(models)
 const selectModelMock = vi.mocked(selectModel)
+import { RpcCallError } from '../rpc.ts'
+
 const sendCommandMock = vi.mocked(sendCommand)
 const cancelSessionMock = vi.mocked(cancelSession)
 const fetchPendingMock = vi.mocked(fetchPending)
@@ -437,6 +439,46 @@ describe('ChatView composer', () => {
     promptMock.mockClear()
     const shifted = pressEnter(input, true)
     expect(shifted.defaultPrevented).toBe(false)
+    expect(promptMock).not.toHaveBeenCalled()
+  })
+
+  it('routes a leading-slash line to the command gateway instead of the model', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
+    sendCommandMock.mockResolvedValue({ commandId: 'cmd-1', result: { kind: 'success' } })
+    render(<ChatView session={session} onBack={() => {}} />)
+    await screen.findByText('已完成修改')
+
+    fireEvent.change(inputBox(), { target: { value: '/permission danger-full-access' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => {
+      expect(sendCommandMock).toHaveBeenCalledWith('s-1', '/permission danger-full-access')
+    })
+    expect(promptMock).not.toHaveBeenCalled()
+    await waitFor(() => { expect(inputBox().value).toBe('') })
+  })
+
+  it('falls back to a prompt when no registered command claims the slash line', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
+    sendCommandMock.mockRejectedValue(new RpcCallError({ code: 'unknown-command', message: 'unknown slash command: /hello' }))
+    render(<ChatView session={session} onBack={() => {}} />)
+    await screen.findByText('已完成修改')
+
+    fireEvent.change(inputBox(), { target: { value: '/hello' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => {
+      expect(promptMock).toHaveBeenCalledWith('s-1', '/hello')
+    })
+  })
+
+  it('surfaces a command execution failure without falling back to the model', async () => {
+    loadHistoryMock.mockResolvedValue(historyPage(turnEvents()))
+    sendCommandMock.mockRejectedValue(new RpcCallError({ code: 'agent-busy', message: 'the agent is mid-turn' }))
+    render(<ChatView session={session} onBack={() => {}} />)
+    await screen.findByText('已完成修改')
+
+    fireEvent.change(inputBox(), { target: { value: '/permission read-only' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    expect(await screen.findByText(/agent is mid-turn/)).toBeTruthy()
     expect(promptMock).not.toHaveBeenCalled()
   })
 })

@@ -305,6 +305,9 @@ function applyEvent(state: FoldState, event: WireEvent): void {
     case 'tool/call':
       applyToolCall(state, event)
       break
+    case 'command/run':
+      applyCommandRun(state, event)
+      break
     case 'request/context': {
       // Wire shape: { provider, model, contextWindow? }. A present finite
       // contextWindow seeds every later assistant message that reports usage.
@@ -317,6 +320,25 @@ function applyEvent(state: FoldState, event: WireEvent): void {
     default:
       break
   }
+}
+
+/** A host-executed slash command renders as the user's own command line. */
+function applyCommandRun(state: FoldState, event: WireEvent): void {
+  const data = isRecord(event.data) ? event.data : {}
+  const name = pickString(data['name'])
+  if (name === undefined) return
+  const args = pickString(data['args']) ?? ''
+  const id = `command-${pickString(data['commandId']) ?? syntheticId('run', event.seq)}`
+  const text = `/${name}${args}`
+  const existing = state.byId.get(id)
+  if (existing !== undefined) {
+    // Idempotent replace (replayed events update in place, never duplicate).
+    replaceMessage(state, existing, { ...existing, text, seq: event.seq, time: event.time })
+    return
+  }
+  const message: RenderMessage = { id, kind: 'user', text, seq: event.seq, time: event.time }
+  state.messages.push(message)
+  state.byId.set(id, message)
 }
 
 function applyUserMessage(state: FoldState, event: WireEvent): void {

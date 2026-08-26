@@ -21,6 +21,7 @@ import type { PendingApproval, PendingQuestionItem } from '../api.ts'
 import { EventFolder, foldEvents, type RenderMessage, type ToolCallInfo, type WireEvent } from '../messages.ts'
 import { renderMarkdown } from '../markdown.ts'
 import { MuxClient } from '../mux.ts'
+import { RpcCallError } from '../rpc.ts'
 import { ThemeToggle } from '../theme-toggle.tsx'
 
 /** Props for the chat view. */
@@ -431,7 +432,18 @@ export function ChatView({ session, mux, onBack }: ChatViewProps) {
     const text = input.trim()
     if (text === '' || sending) return
     setSending(true)
-    void prompt(session.sessionId, text).then(
+    // A slash line goes through the host command gateway (it executes on the
+    // host and never reaches the model as text); an unknown command falls
+    // back to a plain prompt so the model can still see it.
+    const submission = text.startsWith('/')
+      ? sendCommand(session.sessionId, text).catch((reason: unknown) => {
+        if (reason instanceof RpcCallError && reason.error.code === 'unknown-command') {
+          return prompt(session.sessionId, text)
+        }
+        throw reason
+      })
+      : prompt(session.sessionId, text)
+    void submission.then(
       () => {
         setSending(false)
         setInput('')
